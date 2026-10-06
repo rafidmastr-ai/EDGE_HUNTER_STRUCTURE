@@ -16,7 +16,7 @@ Usage:
 Split: chronological 80% train / 20% validation (no shuffling, the validation
 period is strictly after the training period, with an embargo so no training
 trade is still open when validation starts).
-Hyper-parameters, the number of trees and the decision threshold are all chosen
+Hyper-parameters (incl. a fixed tree count) and the decision threshold are chosen
 inside the 80% training data (time-ordered cross-validation); the 20% validation
 set is touched once, for the report.
 """
@@ -40,29 +40,33 @@ ML_DIR = HERE / "results" / "ml_data"
 
 TRAIN_FRACTION = 0.80
 CV_SPLITS = 5
-EARLY_STOP_FRACTION = 0.15  # tail of each CV training fold used only for early stopping
+# Fixed tree counts instead of early stopping: on noisy trade data early stopping halts
+# after 2-5 trees (a near-constant model), so the tree count is chosen by CV instead.
 PARAM_GRID = (
-    {"depth": 4, "l2_leaf_reg": 10},
-    {"depth": 4, "l2_leaf_reg": 30},
-    {"depth": 6, "l2_leaf_reg": 10},
-    {"depth": 6, "l2_leaf_reg": 30},
+    {"depth": 4, "iterations": 400},
+    {"depth": 4, "iterations": 800},
+    {"depth": 6, "iterations": 300},
 )
 BASE_PARAMS = {
-    "loss_function": "Logloss", "eval_metric": "AUC", "learning_rate": 0.03, "iterations": 1500,
-    "rsm": 0.5, "subsample": 0.8, "bootstrap_type": "Bernoulli", "min_data_in_leaf": 20,
+    "loss_function": "Logloss", "learning_rate": 0.03, "l2_leaf_reg": 30,
+    "rsm": 0.5, "subsample": 0.8, "bootstrap_type": "Bernoulli", "min_data_in_leaf": 30,
     "auto_class_weights": "Balanced", "random_seed": 42, "verbose": False, "allow_writing_files": False,
 }
 MIN_WINNERS_KEPT = 0.50  # threshold may not throw away more than half of the winners
 MIN_TRADES_KEPT = 0.10
-# Safety guard: the filter is only switched on when the training data shows a real edge
-# (out-of-fold AUC and out-of-fold net-R improvement). Otherwise every trade is kept.
-MIN_EDGE_AUC = 0.55
+# Safety guard: the filter is only switched on when the training data shows a real edge:
+# out-of-fold AUC >= MIN_EDGE_AUC, a positive total out-of-fold net-R gain, and a gain in at
+# least MIN_EDGE_FOLDS of the CV_SPLITS time periods. Otherwise every trade is kept.
+MIN_EDGE_AUC = 0.53
+MIN_EDGE_FOLDS = 3
+# Final go/no-go: the filter must also raise net R on the untouched 20% validation period.
+# Validation is only used for this yes/no decision, never for tuning.
 
 # Columns that are outcomes, identifiers, timestamps or raw price levels.
 EXCLUDED = {
     "symbol", "filter_profile", "signal_time", "entry_time", "exit_time", "setup_id",
     "result", "pnl_r", "cost_model", "entry", "sl", "tp",
-    "macd_line", "macd_signal", "macd_hist",  # raw price units; side-adjusted/ATR versions kept
+    "macd_line", "macd_signal", "macd_hist", "side_adjusted_macd_hist", "macd_hist_slope_3",  # raw price units; side-adjusted/ATR versions kept
 }
 CATEGORICAL = ["side", "family", "utc_block", "candidate_tier", "candidate_gate_reason", "sl_mode"]
 
@@ -71,7 +75,7 @@ CATEGORICAL = ["side", "family", "utc_block", "candidate_tier", "candidate_gate_
 DIRECTIONAL = [
     "ret_1", "ret_3", "ret_30", "ret_5_atr", "ret_15_atr", "dist_ema20_atr", "dist_ema50_atr",
     "dist_ema200_atr", "ema20_50_gap_atr", "ema50_200_gap_atr", "ema20_slope_5_atr",
-    "ema50_slope_10_atr", "dist_vwap60_atr", "rsi14_slope_3", "macd_hist_slope_3",
+    "ema50_slope_10_atr", "dist_vwap60_atr", "rsi14_slope_3",
     "m5_dir", "m15_dir", "plus_di14", "minus_di14",
 ]
 CENTERED_DIRECTIONAL = {"rsi14": 50.0, "stoch_k14": 50.0, "bb_percent_b": 0.5, "close_location_3": 0.5}
@@ -105,8 +109,6 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     for col, center in CENTERED_DIRECTIONAL.items():
         if col in x:
             x[f"sa_{col}"] = (pd.to_numeric(x[col], errors="coerce") - center) * sign
-    entry = pd.to_numeric(x["entry"], errors="coerce")
-    x["risk_pct"] = (entry - pd.to_numeric(x["sl"], errors="coerce")).abs() / entry * 100.0
     x["rr"] = pd.to_numeric(x["rr"], errors="coerce")
     for col in CATEGORICAL:
         x[col] = x[col].astype(str) if col in x else "NA"
@@ -146,32 +148,22 @@ def make_pool(df: pd.DataFrame, features: list[str], categorical: list[str], y=N
     return Pool(df[features], label=y, cat_features=categorical)
 
 
-def fit_with_early_stopping(df, y, features, categorical, params) -> CatBoostClassifier:
-    """Fit on the older part of df, early-stop on its most recent EARLY_STOP_FRACTION."""
-    cut = int(len(df) * (1 - EARLY_STOP_FRACTION))  # df is time-sorted
-    model = CatBoostClassifier(**BASE_PARAMS, **params, od_type="Iter", od_wait=150, use_best_model=True)
-    model.fit(make_pool(df.iloc[:cut], features, categorical, y[:cut]),
-              eval_set=make_pool(df.iloc[cut:], features, categorical, y[cut:]))
-    return model
-
-
-def cross_validate(train: pd.DataFrame, features, categorical, y) -> tuple[dict, int, np.ndarray]:
-    """Pick params by out-of-fold AUC; return params, tree count and OOF probabilities."""
+def cross_validate(train: pd.DataFrame, features, categorical, y) -> tuple[dict, np.ndarray]:
+    """Pick params by out-of-fold AUC; return params and OOF probabilities."""
     folds = list(time_folds(train["signal_time"], CV_SPLITS))
-    best = (-np.inf, None, None, None)
+    best = (-np.inf, None, None)
     for params in PARAM_GRID:
         oof = np.full(len(train), np.nan)
-        iters = []
         for tr, va in folds:
-            model = fit_with_early_stopping(train.iloc[tr], y[tr], features, categorical, params)
-            iters.append(model.get_best_iteration() + 1)
+            model = CatBoostClassifier(**BASE_PARAMS, **params)
+            model.fit(make_pool(train.iloc[tr], features, categorical, y[tr]))
             oof[va] = model.predict_proba(make_pool(train.iloc[va], features, categorical))[:, 1]
         mask = ~np.isnan(oof)
         auc = roc_auc_score(y[mask], oof[mask])
-        print(f"    {params} oof auc={auc:.4f} trees={iters}")
+        print(f"    {params} oof auc={auc:.4f}")
         if auc > best[0]:
-            best = (auc, params, int(np.median(iters)), oof)
-    return best[1], best[2], best[3]
+            best = (auc, params, oof)
+    return best[1], best[2]
 
 
 # ------------------------------------------------------------------------- evaluation
@@ -208,6 +200,17 @@ def choose_threshold(prob: np.ndarray, pnl: np.ndarray) -> float:
     return float(ok.loc[ok.net_r.idxmax(), "threshold"])
 
 
+def edge_check(oof: np.ndarray, y: np.ndarray, pnl: np.ndarray, folds, threshold: float) -> dict:
+    """Is filtering at `threshold` better than taking every trade, overall and period by period?"""
+    mask = ~np.isnan(oof)
+    gains = [float(pnl[va][oof[va] < threshold].sum() * -1) for _, va in folds]  # R removed by the filter, negated
+    auc = float(roc_auc_score(y[mask], oof[mask]))
+    gain = float(sum(gains))
+    positive = int(sum(g > 0 for g in gains))
+    return {"oof_auc": auc, "oof_net_r_gain": gain, "fold_gains": gains, "folds_positive": positive,
+            "edge_detected": auc >= MIN_EDGE_AUC and gain > 0 and positive >= MIN_EDGE_FOLDS}
+
+
 def report(prob: np.ndarray, valid: pd.DataFrame, y: np.ndarray, threshold: float) -> dict:
     pnl = valid["pnl_r"].to_numpy(float)
     keep = prob >= threshold
@@ -236,18 +239,19 @@ def train_symbol(symbol: str) -> dict:
     print(f"  train {len(train)} trades ({train.signal_time.min()} → {train.signal_time.max()})")
     print(f"  valid {len(valid)} trades ({valid.signal_time.min()} → {valid.signal_time.max()})")
 
-    params, trees, oof = cross_validate(train, features, categorical, y_tr)
+    params, oof = cross_validate(train, features, categorical, y_tr)
     mask = ~np.isnan(oof)
-    oof_pnl = train["pnl_r"].to_numpy(float)[mask]
-    threshold = choose_threshold(oof[mask], oof_pnl)
-    oof_auc = float(roc_auc_score(y_tr[mask], oof[mask]))
-    oof_gain = float(oof_pnl[oof[mask] >= threshold].sum() - oof_pnl.sum())
-    edge = oof_auc >= MIN_EDGE_AUC and oof_gain > 0
-    deployed_threshold = threshold if edge else 0.0
-    final_params = {**BASE_PARAMS, **params, "iterations": trees}
+    pnl_tr = train["pnl_r"].to_numpy(float)
+    threshold = choose_threshold(oof[mask], pnl_tr[mask])
+    check = edge_check(oof, y_tr, pnl_tr, list(time_folds(train["signal_time"], CV_SPLITS)), threshold)
+    edge = check["edge_detected"]
+    final_params = {**BASE_PARAMS, **params}
     model = CatBoostClassifier(**final_params).fit(make_pool(train, features, categorical, y_tr))
     prob = model.predict_proba(make_pool(valid, features, categorical))[:, 1]
     metrics = report(prob, valid, y_va, threshold)
+    validation_gain = metrics["filtered"]["net_r"] - metrics["baseline"]["net_r"]
+    deployed = edge and validation_gain > 0
+    deployed_threshold = threshold if deployed else 0.0
 
     out = ML_DIR / symbol / MODEL_NAME
     out.mkdir(parents=True, exist_ok=True)
@@ -267,19 +271,23 @@ def train_symbol(symbol: str) -> dict:
         "params": {k: v for k, v in final_params.items() if k not in ("verbose", "allow_writing_files")},
         "numeric_features": numeric, "categorical_features": categorical,
         "threshold_rule": f"max out-of-fold net R, winners kept >= {MIN_WINNERS_KEPT:.0%}",
-        "oof_auc": oof_auc, "oof_net_r_gain": oof_gain,
-        "edge_detected": edge,
+        **check,
+        "validation_net_r_gain": validation_gain,
+        "filter_deployed": deployed,
         "deployed_threshold": deployed_threshold,
-        "edge_rule": f"oof AUC >= {MIN_EDGE_AUC} and positive oof net-R gain; otherwise keep all trades",
+        "edge_rule": (f"oof AUC >= {MIN_EDGE_AUC}, positive oof net-R gain, gain in >= {MIN_EDGE_FOLDS}/{CV_SPLITS} "
+                      "CV periods, and a net-R gain on validation; otherwise keep all trades"),
         "validation": metrics,
     }
     (out / "meta.json").write_text(json.dumps(meta, indent=2, default=str))
     b, f = metrics["baseline"], metrics["filtered"]
-    print(f"  params={params} trees={trees} threshold={threshold:.2f} AUC={metrics['auc']:.3f}")
+    print(f"  params={params} threshold={threshold:.2f} AUC={metrics['auc']:.3f}")
     print(f"  validation baseline: {b['trades']} trades, WR {b['win_rate']:.1%}, net {b['net_r']:+.1f}R, PF {b['profit_factor']:.2f}")
     print(f"  validation filtered: {f['trades']} trades, WR {f['win_rate']:.1%}, net {f['net_r']:+.1f}R, PF {f['profit_factor']:.2f}")
     print(f"  winners kept {metrics['winners_kept_pct']:.1%}, losers removed {metrics['losers_removed_pct']:.1%}")
-    print(f"  edge detected: {edge} (oof AUC {oof_auc:.3f}, oof gain {oof_gain:+.1f}R) → deployed threshold {deployed_threshold:.2f}")
+    print(f"  edge detected: {edge} (oof AUC {check['oof_auc']:.3f}, oof gain {check['oof_net_r_gain']:+.1f}R, "
+          f"{check['folds_positive']}/{CV_SPLITS} periods positive)")
+    print(f"  validation gain {validation_gain:+.1f}R → filter deployed: {deployed} (threshold {deployed_threshold:.2f})")
     return meta
 
 
@@ -288,7 +296,9 @@ def summary_row(meta: dict) -> dict:
     b, f = v["baseline"], v["filtered"]
     return {
         "symbol": meta["symbol"], "model": meta["model"], "edge_detected": meta["edge_detected"],
-        "oof_auc": round(meta["oof_auc"], 4), "valid_auc": round(v["auc"], 4),
+        "filter_deployed": meta["filter_deployed"], "validation_net_r_gain": round(meta["validation_net_r_gain"], 2),
+        "oof_auc": round(meta["oof_auc"], 4), "oof_net_r_gain": round(meta["oof_net_r_gain"], 2),
+        "folds_positive": meta["folds_positive"], "valid_auc": round(v["auc"], 4),
         "candidate_threshold": v["threshold"], "deployed_threshold": meta["deployed_threshold"],
         "base_trades": b["trades"], "base_win_rate": round(b["win_rate"], 4), "base_net_r": round(b["net_r"], 2),
         "base_pf": round(b["profit_factor"], 3), "filt_trades": f["trades"], "filt_win_rate": round(f["win_rate"], 4),

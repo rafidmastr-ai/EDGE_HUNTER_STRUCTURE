@@ -1,7 +1,7 @@
 {
   "model": "catboost",
   "symbol": "XAUUSD",
-  "trained_at": "2026-10-06T19:25:28+00:00",
+  "trained_at": "2026-10-06T19:55:20+00:00",
   "label": "pnl_r > 0",
   "split": "chronological 80/20 with embargo",
   "train_period": [
@@ -16,17 +16,16 @@
   "valid_trades": 1291,
   "params": {
     "loss_function": "Logloss",
-    "eval_metric": "AUC",
     "learning_rate": 0.03,
-    "iterations": 32,
+    "l2_leaf_reg": 30,
     "rsm": 0.5,
     "subsample": 0.8,
     "bootstrap_type": "Bernoulli",
-    "min_data_in_leaf": 20,
+    "min_data_in_leaf": 30,
     "auto_class_weights": "Balanced",
     "random_seed": 42,
     "depth": 4,
-    "l2_leaf_reg": 30
+    "iterations": 800
   },
   "numeric_features": [
     "rr",
@@ -94,7 +93,6 @@
     "range_10_atr",
     "range_30_atr",
     "rsi14_slope_3",
-    "macd_hist_slope_3",
     "adx_slope_3",
     "trend_efficiency_20",
     "realized_vol_ratio_30_120",
@@ -109,7 +107,6 @@
     "day_of_week_cos",
     "side_adjusted_ret_5",
     "side_adjusted_ret_15",
-    "side_adjusted_macd_hist",
     "side_adjusted_di_gap",
     "utc_hour",
     "day_of_week",
@@ -133,7 +130,6 @@
     "sa_ema50_slope_10_atr",
     "sa_dist_vwap60_atr",
     "sa_rsi14_slope_3",
-    "sa_macd_hist_slope_3",
     "sa_m5_dir",
     "sa_m15_dir",
     "sa_plus_di14",
@@ -141,8 +137,7 @@
     "sa_rsi14",
     "sa_stoch_k14",
     "sa_bb_percent_b",
-    "sa_close_location_3",
-    "risk_pct"
+    "sa_close_location_3"
   ],
   "categorical_features": [
     "side",
@@ -153,16 +148,26 @@
     "sl_mode"
   ],
   "threshold_rule": "max out-of-fold net R, winners kept >= 50%",
-  "oof_auc": 0.5239439832250339,
-  "oof_net_r_gain": 181.70068757508932,
-  "edge_detected": false,
+  "oof_auc": 0.5303115758152266,
+  "oof_net_r_gain": 247.73417909513708,
+  "fold_gains": [
+    106.03894270235664,
+    52.74019114684825,
+    0.16916333057074695,
+    21.739526774474633,
+    67.04635514088682
+  ],
+  "folds_positive": 5,
+  "edge_detected": true,
+  "validation_net_r_gain": -132.99999999999832,
+  "filter_deployed": false,
   "deployed_threshold": 0.0,
-  "edge_rule": "oof AUC >= 0.55 and positive oof net-R gain; otherwise keep all trades",
+  "edge_rule": "oof AUC >= 0.53, positive oof net-R gain, gain in >= 3/5 CV periods, and a net-R gain on validation; otherwise keep all trades",
   "validation": {
-    "auc": 0.44337273267915556,
-    "log_loss": 0.6967423302738337,
-    "brier": 0.251808225356601,
-    "threshold": 0.49,
+    "auc": 0.4752824858757062,
+    "log_loss": 0.7809763561427946,
+    "brier": 0.27983208942126564,
+    "threshold": 0.28,
     "baseline": {
       "trades": 1291,
       "winners": 531,
@@ -173,15 +178,15 @@
       "profit_factor": 1.3490924013942442
     },
     "filtered": {
-      "trades": 644,
-      "winners": 251,
-      "losers": 393,
-      "win_rate": 0.38975155279503104,
-      "net_r": 89.54283333045299,
-      "avg_r": 0.13904166666219409,
-      "profit_factor": 1.229837146252641
+      "trades": 865,
+      "winners": 346,
+      "losers": 519,
+      "win_rate": 0.4,
+      "net_r": 131.1207001884113,
+      "avg_r": 0.15158462449527316,
+      "profit_factor": 1.2543107099783983
     },
-    "winners_kept_pct": 0.4726930320150659,
-    "losers_removed_pct": 0.48289473684210527
+    "winners_kept_pct": 0.6516007532956686,
+    "losers_removed_pct": 0.3171052631578948
   }
 }

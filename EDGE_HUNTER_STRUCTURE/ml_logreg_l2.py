@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -31,12 +32,12 @@ import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer
-from sklearn.impute import SimpleImputer
+from sklearn.impute import MissingIndicator, SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import KBinsDiscretizer, OneHotEncoder, StandardScaler
 
 MODEL_NAME = "logreg_l2"
 HERE = Path(__file__).resolve().parent
@@ -45,12 +46,17 @@ ML_DIR = HERE / "results" / "ml_data"
 
 TRAIN_FRACTION = 0.80
 CV_SPLITS = 5
-C_GRID = (0.003, 0.01, 0.03, 0.1, 0.3, 1.0)
+C_GRID = (0.0003, 0.001, 0.003, 0.01)
+N_BINS = 5  # each continuous feature becomes 5 quantile bins, so the linear model can fit non-linear effects
 MIN_WINNERS_KEPT = 0.50  # threshold may not throw away more than half of the winners
 MIN_TRADES_KEPT = 0.10
-# Safety guard: the filter is only switched on when the training data shows a real edge
-# (out-of-fold AUC and out-of-fold net-R improvement). Otherwise every trade is kept.
-MIN_EDGE_AUC = 0.55
+# Safety guard: the filter is only switched on when the training data shows a real edge:
+# out-of-fold AUC >= MIN_EDGE_AUC, a positive total out-of-fold net-R gain, and a gain in at
+# least MIN_EDGE_FOLDS of the CV_SPLITS time periods. Otherwise every trade is kept.
+MIN_EDGE_AUC = 0.53
+MIN_EDGE_FOLDS = 3
+# Final go/no-go: the filter must also raise net R on the untouched 20% validation period.
+# Validation is only used for this yes/no decision, never for tuning.
 RANDOM_STATE = 42
 
 # Columns that are outcomes, identifiers, timestamps or raw price levels.
@@ -58,7 +64,7 @@ EXCLUDED = {
     "symbol", "filter_profile", "signal_time", "entry_time", "exit_time", "setup_id",
     "result", "pnl_r", "cost_model", "entry", "sl", "tp",
     "utc_hour", "day_of_week",                      # cyclic sin/cos versions are used instead
-    "macd_line", "macd_signal", "macd_hist",       # raw price units; side-adjusted/ATR versions kept
+    "macd_line", "macd_signal", "macd_hist", "side_adjusted_macd_hist", "macd_hist_slope_3",       # raw price units; side-adjusted/ATR versions kept
 }
 CATEGORICAL = ["side", "family", "utc_block", "candidate_tier", "candidate_gate_reason", "sl_mode"]
 
@@ -67,7 +73,7 @@ CATEGORICAL = ["side", "family", "utc_block", "candidate_tier", "candidate_gate_
 DIRECTIONAL = [
     "ret_1", "ret_3", "ret_30", "ret_5_atr", "ret_15_atr", "dist_ema20_atr", "dist_ema50_atr",
     "dist_ema200_atr", "ema20_50_gap_atr", "ema50_200_gap_atr", "ema20_slope_5_atr",
-    "ema50_slope_10_atr", "dist_vwap60_atr", "rsi14_slope_3", "macd_hist_slope_3",
+    "ema50_slope_10_atr", "dist_vwap60_atr", "rsi14_slope_3",
     "m5_dir", "m15_dir", "plus_di14", "minus_di14",
 ]
 CENTERED_DIRECTIONAL = {"rsi14": 50.0, "stoch_k14": 50.0, "bb_percent_b": 0.5, "close_location_3": 0.5}
@@ -101,18 +107,24 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     for col, center in CENTERED_DIRECTIONAL.items():
         if col in x:
             x[f"sa_{col}"] = (pd.to_numeric(x[col], errors="coerce") - center) * sign
-    entry = pd.to_numeric(x["entry"], errors="coerce")
-    x["risk_pct"] = (entry - pd.to_numeric(x["sl"], errors="coerce")).abs() / entry * 100.0
     x["rr"] = pd.to_numeric(x["rr"], errors="coerce")
     for col in CATEGORICAL:
         x[col] = x[col].astype(str) if col in x else "NA"
     return x
 
 
-def feature_columns(df: pd.DataFrame) -> tuple[list[str], list[str]]:
+def feature_columns(df: pd.DataFrame) -> tuple[list[str], list[str], list[str]]:
+    """Continuous features (binned), discrete numeric features (scaled as-is), categorical features."""
     dropped = EXCLUDED | set(DIRECTIONAL) | set(CENTERED_DIRECTIONAL) | set(CATEGORICAL)
     numeric = [c for c in df.columns if c not in dropped and pd.api.types.is_numeric_dtype(df[c])]
-    return numeric, list(CATEGORICAL)
+    continuous = [c for c in numeric if df[c].nunique() > 2 * N_BINS]
+    discrete = [c for c in numeric if c not in continuous and df[c].nunique() > 1]
+    return continuous, discrete, list(CATEGORICAL)
+
+
+def setup_weights(df: pd.DataFrame) -> np.ndarray:
+    """Each setup appears once per RR/SL config with nearly the same label; weight 1/n so a setup counts once."""
+    return 1.0 / df.groupby("setup_id")["setup_id"].transform("size").to_numpy(float)
 
 
 def chronological_split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -154,28 +166,39 @@ class Winsorizer(BaseEstimator, TransformerMixin):
         return np.asarray(input_features, dtype=object)
 
 
-def build_pipeline(numeric: list[str], categorical: list[str], C: float) -> Pipeline:
-    num = Pipeline([
+def build_pipeline(continuous: list[str], discrete: list[str], categorical: list[str], C: float) -> Pipeline:
+    binned = Pipeline([
         ("clip", Winsorizer()),
-        ("impute", SimpleImputer(strategy="median", add_indicator=True, keep_empty_features=True)),
+        ("impute", SimpleImputer(strategy="median", keep_empty_features=True)),
+        ("bins", KBinsDiscretizer(n_bins=N_BINS, encode="onehot", strategy="quantile",
+                                  quantile_method="averaged_inverted_cdf")),
+    ])
+    plain = Pipeline([
+        ("impute", SimpleImputer(strategy="median", keep_empty_features=True)),
         ("scale", StandardScaler()),
     ])
+    missing = MissingIndicator(features="missing-only", error_on_new=False)  # e.g. "no FVG in this setup"
     cat = OneHotEncoder(handle_unknown="ignore", min_frequency=20)
-    pre = ColumnTransformer([("num", num, numeric), ("cat", cat, categorical)])
+    pre = ColumnTransformer([
+        ("bin", binned, continuous), ("num", plain, discrete),
+        ("missing", missing, continuous + discrete), ("cat", cat, categorical),
+    ], sparse_threshold=0)
     # L2 is sklearn's default penalty; C is the inverse regularisation strength.
     clf = LogisticRegression(C=C, class_weight="balanced", max_iter=5000,
                              solver="lbfgs", random_state=RANDOM_STATE)
     return Pipeline([("pre", pre), ("clf", clf)])
 
 
-def cross_validate(train: pd.DataFrame, numeric, categorical, y) -> tuple[float, np.ndarray]:
+def cross_validate(train: pd.DataFrame, continuous, discrete, categorical, y) -> tuple[float, np.ndarray]:
     """Pick C by out-of-fold AUC (ranking quality is what the filter needs); return C and OOF probabilities."""
     folds = list(time_folds(train["signal_time"], CV_SPLITS))
     best = (-np.inf, None, None)
     for C in C_GRID:
         oof = np.full(len(train), np.nan)
         for tr, va in folds:
-            model = build_pipeline(numeric, categorical, C).fit(train.iloc[tr], y[tr])
+            fold = train.iloc[tr]
+            model = build_pipeline(continuous, discrete, categorical, C).fit(
+                fold, y[tr], clf__sample_weight=setup_weights(fold))
             oof[va] = model.predict_proba(train.iloc[va])[:, 1]
         mask = ~np.isnan(oof)
         auc = roc_auc_score(y[mask], oof[mask])
@@ -219,6 +242,17 @@ def choose_threshold(prob: np.ndarray, pnl: np.ndarray) -> float:
     return float(ok.loc[ok.net_r.idxmax(), "threshold"])
 
 
+def edge_check(oof: np.ndarray, y: np.ndarray, pnl: np.ndarray, folds, threshold: float) -> dict:
+    """Is filtering at `threshold` better than taking every trade, overall and period by period?"""
+    mask = ~np.isnan(oof)
+    gains = [float(pnl[va][oof[va] < threshold].sum() * -1) for _, va in folds]  # R removed by the filter, negated
+    auc = float(roc_auc_score(y[mask], oof[mask]))
+    gain = float(sum(gains))
+    positive = int(sum(g > 0 for g in gains))
+    return {"oof_auc": auc, "oof_net_r_gain": gain, "fold_gains": gains, "folds_positive": positive,
+            "edge_detected": auc >= MIN_EDGE_AUC and gain > 0 and positive >= MIN_EDGE_FOLDS}
+
+
 def report(prob: np.ndarray, valid: pd.DataFrame, y: np.ndarray, threshold: float) -> dict:
     pnl = valid["pnl_r"].to_numpy(float)
     keep = prob >= threshold
@@ -240,23 +274,25 @@ def train_symbol(symbol: str) -> dict:
     print(f"\n=== {symbol} — {MODEL_NAME}")
     df = add_features(load_trades(symbol))
     train, valid = chronological_split(df)
-    numeric, categorical = feature_columns(df)
+    continuous, discrete, categorical = feature_columns(train)
     y_tr = (train["pnl_r"] > 0).astype(int).to_numpy()
     y_va = (valid["pnl_r"] > 0).astype(int).to_numpy()
     print(f"  train {len(train)} trades ({train.signal_time.min()} → {train.signal_time.max()})")
     print(f"  valid {len(valid)} trades ({valid.signal_time.min()} → {valid.signal_time.max()})")
 
-    C, oof = cross_validate(train, numeric, categorical, y_tr)
+    C, oof = cross_validate(train, continuous, discrete, categorical, y_tr)
     mask = ~np.isnan(oof)
-    oof_pnl = train["pnl_r"].to_numpy(float)[mask]
-    threshold = choose_threshold(oof[mask], oof_pnl)
-    oof_auc = float(roc_auc_score(y_tr[mask], oof[mask]))
-    oof_gain = float(oof_pnl[oof[mask] >= threshold].sum() - oof_pnl.sum())
-    edge = oof_auc >= MIN_EDGE_AUC and oof_gain > 0
-    deployed_threshold = threshold if edge else 0.0
-    model = build_pipeline(numeric, categorical, C).fit(train, y_tr)
+    pnl_tr = train["pnl_r"].to_numpy(float)
+    threshold = choose_threshold(oof[mask], pnl_tr[mask])
+    check = edge_check(oof, y_tr, pnl_tr, list(time_folds(train["signal_time"], CV_SPLITS)), threshold)
+    edge = check["edge_detected"]
+    model = build_pipeline(continuous, discrete, categorical, C).fit(
+        train, y_tr, clf__sample_weight=setup_weights(train))
     prob = model.predict_proba(valid)[:, 1]
     metrics = report(prob, valid, y_va, threshold)
+    validation_gain = metrics["filtered"]["net_r"] - metrics["baseline"]["net_r"]
+    deployed = edge and validation_gain > 0
+    deployed_threshold = threshold if deployed else 0.0
 
     out = ML_DIR / symbol / MODEL_NAME
     out.mkdir(parents=True, exist_ok=True)
@@ -274,12 +310,15 @@ def train_symbol(symbol: str) -> dict:
         "train_period": [train.signal_time.min(), train.signal_time.max()],
         "valid_period": [valid.signal_time.min(), valid.signal_time.max()],
         "train_trades": len(train), "valid_trades": len(valid), "C": C,
-        "numeric_features": numeric, "categorical_features": categorical,
+        "numeric_features": continuous + discrete, "binned_features": continuous,
+        "categorical_features": categorical,
         "threshold_rule": f"max out-of-fold net R, winners kept >= {MIN_WINNERS_KEPT:.0%}",
-        "oof_auc": oof_auc, "oof_net_r_gain": oof_gain,
-        "edge_detected": edge,
+        **check,
+        "validation_net_r_gain": validation_gain,
+        "filter_deployed": deployed,
         "deployed_threshold": deployed_threshold,
-        "edge_rule": f"oof AUC >= {MIN_EDGE_AUC} and positive oof net-R gain; otherwise keep all trades",
+        "edge_rule": (f"oof AUC >= {MIN_EDGE_AUC}, positive oof net-R gain, gain in >= {MIN_EDGE_FOLDS}/{CV_SPLITS} "
+                      "CV periods, and a net-R gain on validation; otherwise keep all trades"),
         "validation": metrics,
     }
     (out / "meta.json").write_text(json.dumps(meta, indent=2, default=str))
@@ -288,7 +327,9 @@ def train_symbol(symbol: str) -> dict:
     print(f"  validation baseline: {b['trades']} trades, WR {b['win_rate']:.1%}, net {b['net_r']:+.1f}R, PF {b['profit_factor']:.2f}")
     print(f"  validation filtered: {f['trades']} trades, WR {f['win_rate']:.1%}, net {f['net_r']:+.1f}R, PF {f['profit_factor']:.2f}")
     print(f"  winners kept {metrics['winners_kept_pct']:.1%}, losers removed {metrics['losers_removed_pct']:.1%}")
-    print(f"  edge detected: {edge} (oof AUC {oof_auc:.3f}, oof gain {oof_gain:+.1f}R) → deployed threshold {deployed_threshold:.2f}")
+    print(f"  edge detected: {edge} (oof AUC {check['oof_auc']:.3f}, oof gain {check['oof_net_r_gain']:+.1f}R, "
+          f"{check['folds_positive']}/{CV_SPLITS} periods positive)")
+    print(f"  validation gain {validation_gain:+.1f}R → filter deployed: {deployed} (threshold {deployed_threshold:.2f})")
     return meta
 
 
@@ -297,7 +338,9 @@ def summary_row(meta: dict) -> dict:
     b, f = v["baseline"], v["filtered"]
     return {
         "symbol": meta["symbol"], "model": meta["model"], "edge_detected": meta["edge_detected"],
-        "oof_auc": round(meta["oof_auc"], 4), "valid_auc": round(v["auc"], 4),
+        "filter_deployed": meta["filter_deployed"], "validation_net_r_gain": round(meta["validation_net_r_gain"], 2),
+        "oof_auc": round(meta["oof_auc"], 4), "oof_net_r_gain": round(meta["oof_net_r_gain"], 2),
+        "folds_positive": meta["folds_positive"], "valid_auc": round(v["auc"], 4),
         "candidate_threshold": v["threshold"], "deployed_threshold": meta["deployed_threshold"],
         "base_trades": b["trades"], "base_win_rate": round(b["win_rate"], 4), "base_net_r": round(b["net_r"], 2),
         "base_pf": round(b["profit_factor"], 3), "filt_trades": f["trades"], "filt_win_rate": round(f["win_rate"], 4),
@@ -329,6 +372,7 @@ def predict(symbol: str, input_csv: Path, output_csv: Path | None) -> pd.DataFra
 
 
 def main() -> None:
+    warnings.filterwarnings("ignore", message="Bins whose width are too small")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     t = sub.add_parser("train")
