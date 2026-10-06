@@ -68,7 +68,7 @@ EXCLUDED = {
     "result", "pnl_r", "cost_model", "entry", "sl", "tp",
     "macd_line", "macd_signal", "macd_hist", "side_adjusted_macd_hist", "macd_hist_slope_3",  # raw price units; side-adjusted/ATR versions kept
 }
-CATEGORICAL = ["side", "family", "utc_block", "candidate_tier", "candidate_gate_reason", "sl_mode"]
+CATEGORICAL = ["side", "family", "utc_block", "candidate_tier", "candidate_gate_reason", "sl_mode", "session"]
 
 # Direction-dependent features, multiplied by +1 (BUY) / -1 (SELL). Trees could learn the
 # side interaction themselves, but the aligned versions let them do it with far fewer splits.

@@ -66,7 +66,7 @@ EXCLUDED = {
     "utc_hour", "day_of_week",                      # cyclic sin/cos versions are used instead
     "macd_line", "macd_signal", "macd_hist", "side_adjusted_macd_hist", "macd_hist_slope_3",       # raw price units; side-adjusted/ATR versions kept
 }
-CATEGORICAL = ["side", "family", "utc_block", "candidate_tier", "candidate_gate_reason", "sl_mode"]
+CATEGORICAL = ["side", "family", "utc_block", "candidate_tier", "candidate_gate_reason", "sl_mode", "session"]
 
 # Direction-dependent features: for a SELL the "good" sign is reversed, so a linear
 # model needs them multiplied by +1 (BUY) / -1 (SELL). Raw versions are dropped.

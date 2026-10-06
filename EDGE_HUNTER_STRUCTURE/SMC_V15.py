@@ -13,6 +13,8 @@ Research period (UTC): 2020-01-01 -> 2026-09-30
 Data source: data/tick_cache/<SYMBOL>.parquet (preferred) or CSV fallback.
 Execution: M1 decision -> next M1 executable quote; SL/TP resolved on ticks.
 Higher timeframes: M5 and M15 are mapped only after their bars are complete.
+Context features (H1/H4/D1, prior day/week levels, sessions) follow the same rule
+and are ML features only; they never change which candidates are produced.
 Holding horizon: maximum 120 minutes.
 Cost model: GROSS price performance only. Broker spread and commission are
 excluded. Tick Data are used only to reconstruct a broker-neutral market price
@@ -97,7 +99,7 @@ ATR_CAP = 2.50
 MAX_HOLD_MINUTES = 120
 
 # Feature-layer revision only; strategy rules and execution logic are unchanged.
-FEATURE_LAYER_VERSION = "V15_SMC_EVENT_FEATURES_1"
+FEATURE_LAYER_VERSION = "V15_SMC_EVENT_FEATURES_2_CONTEXT"
 
 # Broker-neutral cost model. Spread and commission are intentionally excluded.
 # The user applies broker-specific spread/commission separately after the research.
@@ -933,6 +935,222 @@ def asof_feature(base: pd.DataFrame, higher: pd.DataFrame, higher_rule: str, dec
     return z
 
 
+# ---------------------------------------------------------------------------
+# V15 context feature layer (FEATURES ONLY — never used as entry gates)
+# ---------------------------------------------------------------------------
+# The SMC features above describe the setup itself. The context layer adds what
+# the setup cannot see: H1/H4/D1 trend and structure, prior-day/week liquidity,
+# today's range and Asian range, trading session and the room to the first
+# higher-timeframe liquidity in units of the trade's own risk.
+# Everything is causal: higher-timeframe bars are used only after they close
+# (asof_feature), intraday values include the signal bar but nothing after it.
+CONTEXT_FULL_DAY_MIN_BARS = 360   # D1 levels/ATR ignore thin days (e.g. Sunday open)
+ASIA_END_HOUR_UTC = 7
+LONDON_TZ = "Europe/London"
+NEW_YORK_TZ = "America/New_York"
+SESSION_OPEN_MIN = 8 * 60           # 08:00 local time in London and New York
+LONDON_CLOSE_MIN = 16 * 60 + 30
+NEW_YORK_CLOSE_MIN = 17 * 60
+
+
+def _resample_bars(b1: pd.DataFrame, rule: str) -> pd.DataFrame:
+    s = b1.set_index("timestamp")
+    h = s.resample(rule, label="left", closed="left").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+    )
+    h["m1_bars"] = s["close"].resample(rule, label="left", closed="left").count()
+    return h.dropna(subset=["open", "high", "low", "close"]).reset_index()
+
+
+def _swing_memory(h: pd.DataFrame, w: int = SWING) -> pd.DataFrame:
+    """Last and previous confirmed swing high/low known at each higher-timeframe bar."""
+    hi_known, lo_known = _delayed_pivot_levels(h, w)
+    out = pd.DataFrame(index=h.index)
+    for name, known in (("hi", hi_known), ("lo", lo_known)):
+        pts = known.dropna()
+        out[f"sw_{name}"] = known.ffill()
+        out[f"prev_sw_{name}"] = pd.Series(pts.shift(1).to_numpy(), index=pts.index).reindex(h.index).ffill()
+    return out
+
+
+def add_context_features(b1: pd.DataFrame) -> pd.DataFrame:
+    """Attach raw ctx_* columns to M1 bars; side-aware features are derived per candidate."""
+    d = b1.copy()
+    ts = d["timestamp"]
+
+    # H1: trend, momentum, ADX and confirmed swing structure.
+    h1 = _resample_bars(d, "1h")
+    h1["ema20"] = ema(h1["close"], 20); h1["ema50"] = ema(h1["close"], 50)
+    h1["atr"] = atr(h1, ATR_PERIOD); h1["rsi"] = rsi(h1["close"], 14)
+    h1["adx"], _, _ = adx(h1, 14)
+    h1 = pd.concat([h1, _swing_memory(h1)], axis=1)
+    h1_cols = ["ema20", "ema50", "atr", "rsi", "adx", "sw_hi", "sw_lo", "prev_sw_hi", "prev_sw_lo"]
+    z = asof_feature(d, h1[["timestamp"] + h1_cols], "1h")
+    for c in h1_cols:
+        d[f"ctx_h1_{c}"] = z[c].to_numpy(float)
+
+    # H4: trend, momentum and 20-bar dealing range (premium/discount).
+    h4 = _resample_bars(d, "4h")
+    h4["ema20"] = ema(h4["close"], 20); h4["ema50"] = ema(h4["close"], 50)
+    h4["atr"] = atr(h4, ATR_PERIOD); h4["rsi"] = rsi(h4["close"], 14)
+    h4["hi20"] = h4["high"].rolling(20, min_periods=10).max()
+    h4["lo20"] = h4["low"].rolling(20, min_periods=10).min()
+    h4_cols = ["ema20", "ema50", "atr", "rsi", "hi20", "lo20"]
+    z = asof_feature(d, h4[["timestamp"] + h4_cols], "4h")
+    for c in h4_cols:
+        d[f"ctx_h4_{c}"] = z[c].to_numpy(float)
+
+    # D1 (full sessions only): trend, ATR regime, previous-day high/low.
+    d1 = _resample_bars(d, "1D")
+    d1 = d1[d1["m1_bars"] >= CONTEXT_FULL_DAY_MIN_BARS].reset_index(drop=True)
+    d1["ema20"] = ema(d1["close"], 20); d1["ema50"] = ema(d1["close"], 50)
+    d1["atr"] = atr(d1, ATR_PERIOD)
+    d1["atr_med60"] = d1["atr"].rolling(60, min_periods=20).median()
+    d1 = d1.rename(columns={"high": "pdh", "low": "pdl"})
+    d1_cols = ["ema20", "ema50", "atr", "atr_med60", "pdh", "pdl"]
+    z = asof_feature(d, d1[["timestamp"] + d1_cols], "1D")
+    for c in d1_cols:
+        d[f"ctx_d1_{c}"] = z[c].to_numpy(float)
+
+    # Previous completed week (Monday-anchored) high/low.
+    wk = d1.assign(week=d1["timestamp"].dt.floor("D") - pd.to_timedelta(d1["timestamp"].dt.dayofweek, unit="D"))
+    wk = wk.groupby("week").agg(pwh=("pdh", "max"), pwl=("pdl", "min")).reset_index().rename(columns={"week": "timestamp"})
+    z = asof_feature(d, wk, "7D")
+    d["ctx_pwh"] = z["pwh"].to_numpy(float); d["ctx_pwl"] = z["pwl"].to_numpy(float)
+
+    # Today so far (UTC day, includes the signal bar) and the Asian range.
+    day = ts.dt.floor("D")
+    g = d.groupby(day, sort=False)
+    d["ctx_day_open"] = g["open"].transform("first")
+    d["ctx_day_high"] = g["high"].cummax()
+    d["ctx_day_low"] = g["low"].cummin()
+    asia = ts.dt.hour < ASIA_END_HOUR_UTC
+    d["ctx_asia_high"] = d["high"].where(asia).groupby(day).cummax().groupby(day).ffill()
+    d["ctx_asia_low"] = d["low"].where(asia).groupby(day).cummin().groupby(day).ffill()
+
+    # Trading session from local London/New York clocks (DST-aware).
+    lon = ts.dt.tz_convert(LONDON_TZ); ny = ts.dt.tz_convert(NEW_YORK_TZ)
+    lon_min = (lon.dt.hour * 60 + lon.dt.minute).to_numpy()
+    ny_min = (ny.dt.hour * 60 + ny.dt.minute).to_numpy()
+    in_lon = (lon_min >= SESSION_OPEN_MIN) & (lon_min < LONDON_CLOSE_MIN)
+    in_ny = (ny_min >= SESSION_OPEN_MIN) & (ny_min < NEW_YORK_CLOSE_MIN)
+    d["ctx_session"] = np.select([in_lon & in_ny, in_lon, in_ny], ["LONDON_NY_OVERLAP", "LONDON", "NEW_YORK"], "ASIA")
+    d["ctx_session_minutes"] = np.select(
+        [in_ny, in_lon], [ny_min - SESSION_OPEN_MIN, lon_min - SESSION_OPEN_MIN], (ny_min - NEW_YORK_CLOSE_MIN) % 1440
+    ).astype(float)
+
+    vol = d["volume"].astype(float)
+    d["ctx_activity_ratio"] = vol.rolling(60, min_periods=30).mean() / vol.rolling(1440, min_periods=300).mean().replace(0.0, np.nan)
+    return d
+
+
+def _ratio(num: float, den: float) -> float:
+    return _feature_value(num / den) if np.isfinite(num) and np.isfinite(den) and den > 0 else np.nan
+
+
+def _discount_aligned(close: float, lo: float, hi: float, side: str) -> float:
+    """0 = at the extreme against the trade (best SMC location), 1 = at the target-side extreme."""
+    pos = _ratio(close - lo, hi - lo)
+    if not np.isfinite(pos):
+        return np.nan
+    return float(np.clip(pos if side == "BUY" else 1.0 - pos, -1.0, 2.0))
+
+
+def _context_candidate_features(row: pd.Series, side: str, atr_value: float, invalidation: float) -> dict:
+    """Side-aware context features for one candidate, from the signal bar's ctx_* columns."""
+    g = lambda k: float(row[k]) if k in row.index and pd.notna(row[k]) else np.nan
+    sgn = 1.0 if side == "BUY" else -1.0
+    close = float(row.close); a = float(atr_value) if np.isfinite(atr_value) and atr_value > 0 else np.nan
+    risk = abs(close - invalidation) if np.isfinite(invalidation) else np.nan
+    risk = risk if np.isfinite(risk) and risk > 0 else np.nan
+    datr = g("ctx_d1_atr")
+
+    def trend(prefix: str) -> float:
+        return _ratio(sgn * (g(f"ctx_{prefix}_ema20") - g(f"ctx_{prefix}_ema50")), g(f"ctx_{prefix}_atr"))
+
+    h1_t, h4_t, d1_t = trend("h1"), trend("h4"), trend("d1")
+    pdh, pdl, pwh, pwl = g("ctx_d1_pdh"), g("ctx_d1_pdl"), g("ctx_pwh"), g("ctx_pwl")
+    day_hi, day_lo = g("ctx_day_high"), g("ctx_day_low")
+    asia_hi, asia_lo = g("ctx_asia_high"), g("ctx_asia_low")
+    sw_hi, sw_lo, psw_hi, psw_lo = g("ctx_h1_sw_hi"), g("ctx_h1_sw_lo"), g("ctx_h1_prev_sw_hi"), g("ctx_h1_prev_sw_lo")
+
+    # Signed distances: "target" = in the trade direction, "against" = toward the stop side.
+    def to_target(level: float) -> float:
+        return sgn * (level - close)
+
+    def to_against(level: float) -> float:
+        return sgn * (close - level)
+
+    tgt_pd, ag_pd = (pdh, pdl) if side == "BUY" else (pdl, pdh)
+    tgt_pw, ag_pw = (pwh, pwl) if side == "BUY" else (pwl, pwh)
+    tgt_sw, ag_sw = (sw_hi, sw_lo) if side == "BUY" else (sw_lo, sw_hi)
+    tgt_asia = asia_hi if side == "BUY" else asia_lo
+    tgt_day = day_hi if side == "BUY" else day_lo
+
+    if all(np.isfinite([sw_hi, sw_lo, psw_hi, psw_lo])):
+        bull = sw_hi > psw_hi and sw_lo > psw_lo
+        bear = sw_hi < psw_hi and sw_lo < psw_lo
+        structure = sgn * (1.0 if bull else -1.0 if bear else 0.0)
+    else:
+        structure = np.nan
+
+    if np.isfinite(pdh) and np.isfinite(pdl) and np.isfinite(day_hi) and np.isfinite(day_lo):
+        target_swept = float(day_hi > pdh) if side == "BUY" else float(day_lo < pdl)
+        against_swept = float(day_lo < pdl) if side == "BUY" else float(day_hi > pdh)
+    else:
+        target_swept = against_swept = np.nan
+
+    liquidity = [to_target(x) for x in (tgt_sw, tgt_pd, tgt_pw, tgt_asia, tgt_day) if np.isfinite(x)]
+    liquidity = [x for x in liquidity if x > 0]
+    first_liq_r = _ratio(min(liquidity), risk) if liquidity else np.nan
+
+    agree = [t for t in (h1_t, h4_t, d1_t) if np.isfinite(t)]
+    rsi_h1, rsi_h4 = g("ctx_h1_rsi"), g("ctx_h4_rsi")
+    return {
+        "session": str(row["ctx_session"]) if "ctx_session" in row.index else "UNKNOWN",
+        "session_minutes": g("ctx_session_minutes"),
+        "h1_trend_aligned": h1_t, "h4_trend_aligned": h4_t, "d1_trend_aligned": d1_t,
+        "htf_trend_agreement": float(sum(t > 0 for t in agree)) if agree else np.nan,
+        "h1_dist_ema50_aligned": _ratio(sgn * (close - g("ctx_h1_ema50")), g("ctx_h1_atr")),
+        "h4_dist_ema50_aligned": _ratio(sgn * (close - g("ctx_h4_ema50")), g("ctx_h4_atr")),
+        "h1_rsi_aligned": _feature_value(sgn * (rsi_h1 - 50.0)),
+        "h4_rsi_aligned": _feature_value(sgn * (rsi_h4 - 50.0)),
+        "h1_adx14": _feature_value(g("ctx_h1_adx")),
+        "h1_structure_aligned": _feature_value(structure),
+        "h4_discount_aligned": _discount_aligned(close, g("ctx_h4_lo20"), g("ctx_h4_hi20"), side),
+        "risk_atr": _ratio(risk, a),
+        "risk_d1atr": _ratio(risk, datr),
+        "h1_swing_target_r": _ratio(to_target(tgt_sw), risk),
+        "h1_swing_against_r": _ratio(to_against(ag_sw), risk),
+        "pd_target_d1atr": _ratio(to_target(tgt_pd), datr),
+        "pd_against_d1atr": _ratio(to_against(ag_pd), datr),
+        "pd_target_r": _ratio(to_target(tgt_pd), risk),
+        "pw_target_d1atr": _ratio(to_target(tgt_pw), datr),
+        "pw_against_d1atr": _ratio(to_against(ag_pw), datr),
+        "pd_target_swept_today": target_swept,
+        "pd_against_swept_today": against_swept,
+        "day_range_used_d1atr": _ratio(day_hi - day_lo, datr),
+        "day_discount_aligned": _discount_aligned(close, day_lo, day_hi, side),
+        "day_open_move_aligned": _ratio(sgn * (close - g("ctx_day_open")), datr),
+        "asia_range_d1atr": _ratio(asia_hi - asia_lo, datr),
+        "asia_discount_aligned": _discount_aligned(close, asia_lo, asia_hi, side),
+        "first_liquidity_target_r": first_liq_r,
+        "d1_atr_regime": _ratio(datr, g("ctx_d1_atr_med60")),
+        "m1_atr_to_d1atr": _ratio(a, datr),
+        "activity_ratio_60_1440": _feature_value(g("ctx_activity_ratio")),
+    }
+
+
+CONTEXT_FEATURES = (
+    "session_minutes", "h1_trend_aligned", "h4_trend_aligned", "d1_trend_aligned", "htf_trend_agreement",
+    "h1_dist_ema50_aligned", "h4_dist_ema50_aligned", "h1_rsi_aligned", "h4_rsi_aligned", "h1_adx14",
+    "h1_structure_aligned", "h4_discount_aligned", "risk_atr", "risk_d1atr", "h1_swing_target_r",
+    "h1_swing_against_r", "pd_target_d1atr", "pd_against_d1atr", "pd_target_r", "pw_target_d1atr",
+    "pw_against_d1atr", "pd_target_swept_today", "pd_against_swept_today", "day_range_used_d1atr",
+    "day_discount_aligned", "day_open_move_aligned", "asia_range_d1atr", "asia_discount_aligned",
+    "first_liquidity_target_r", "d1_atr_regime", "m1_atr_to_d1atr", "activity_ratio_60_1440",
+)
+
 
 FEATURE_NUMERIC = (
     # Existing SMC features — preserved.
@@ -960,9 +1178,11 @@ FEATURE_NUMERIC = (
     # Family-specific causal geometry; NaN for non-applicable families.
     "ob_body_quality","ob_to_bos_distance_atr","fvg_to_displacement_ratio","fvg_fill_depth",
     "midpoint_retest_depth",
+    # Context layer: H1/H4/D1 trend & structure, day/week liquidity, session, room to target.
+    *CONTEXT_FEATURES,
 )
 
-FEATURE_CATEGORICAL = ("side","family","utc_block","candidate_tier")
+FEATURE_CATEGORICAL = ("side","family","utc_block","candidate_tier","session")
 
 
 def _utc_block(hour: int) -> str:
@@ -1177,6 +1397,8 @@ def build_candidates(
     filter_profile: str = V15_PROFILE, diagnostics: bool = False, symbol: str = "",
 ):
     """Build candidates and optionally return stage-by-stage filter diagnostics."""
+    if "ctx_d1_atr" not in bars1.columns:
+        bars1 = add_context_features(bars1)
     d = add_structure_features(bars1)
     sw_hi = d["swing_high_raw"].to_numpy(bool)
     sw_lo = d["swing_low_raw"].to_numpy(bool)
@@ -1372,6 +1594,7 @@ def build_candidates(
                 float(m15_trend_strength_arr[i]) if np.isfinite(m15_trend_strength_arr[i]) else np.nan,
                 known_swing_highs, known_swing_lows,
             )
+            feature_payload.update(_context_candidate_features(d.iloc[i], side, a, invalidation))
 
             # V15 quality-preserving gate. Full SMC structure and existing
             # displacement/confirmation/HTF safeguards above are unchanged.
@@ -2012,7 +2235,7 @@ def _write_feature_analysis(trades:pd.DataFrame,candidates:pd.DataFrame,out:Path
     _metric_rows(x,["symbol","family","rr","sl_mode","confluence_count","confluence_families"]).to_csv(out/"SMC_V15_CONFLUENCE_ANALYSIS.csv",index=False,encoding="utf-8-sig")
     _metric_rows(x[x.triple_confluence],["symbol","family","rr","sl_mode","side","confluence_families"]).to_csv(out/"SMC_V15_TRIPLE_CONFLUENCE.csv",index=False,encoding="utf-8-sig")
     q=c.groupby(["symbol","family","quality_score","quality_band"],sort=False).size().reset_index(name="candidate_count"); q.to_csv(out/"SMC_V15_CANDIDATE_QUALITY_COUNTS.csv",index=False,encoding="utf-8-sig")
-    dictionary=("SMC V15 FEATURE DICTIONARY\n"+"="*96+"\n"+"Features are available at or before signal close; no future outcome/exit data is used.\n\nExisting SMC features preserved. Added technical/market-state features plus the V15 causal SMC-event expansion (sweep reclaim/wick, sweep-to-BOS timing/move, BOS break strength, displacement expansion/compression, sequence age, liquidity distances/asymmetry, M5/M15 trend strength/consistency, and family-specific OB/FVG/midpoint geometry). Strategy rules remain unchanged.\n\nNumeric features:\n"+"\n".join("- "+f for f in FEATURE_NUMERIC)+"\n\nCategorical features:\n"+"\n".join("- "+f for f in FEATURE_CATEGORICAL)+"\n\nV15 candidate limits:\nA: "+str(V15_FILTERS["A_OB_RETEST_SEQUENCE"])+"\nB: "+str(V15_FILTERS["B_FVG_RETEST_SEQUENCE"])+"\nC: "+str(V15_FILTERS["C_DISPLACEMENT_MID_RETEST"])+"\n")
+    dictionary=("SMC V15 FEATURE DICTIONARY\n"+"="*96+"\n"+"Features are available at or before signal close; no future outcome/exit data is used.\n\nExisting SMC features preserved. Added technical/market-state features plus the V15 causal SMC-event expansion (sweep reclaim/wick, sweep-to-BOS timing/move, BOS break strength, displacement expansion/compression, sequence age, liquidity distances/asymmetry, M5/M15 trend strength/consistency, and family-specific OB/FVG/midpoint geometry). Context layer: H1/H4/D1 trend/RSI/ADX/swing structure, H4 premium-discount, previous day/week high-low distances and sweeps, today's range/position/open move, Asian range, London/New York session (DST-aware), first higher-timeframe liquidity in R, risk size in ATR/D1-ATR, daily volatility regime and tick activity. Side-aware features are aligned so positive = in favour of the trade. Strategy rules remain unchanged.\n\nNumeric features:\n"+"\n".join("- "+f for f in FEATURE_NUMERIC)+"\n\nCategorical features:\n"+"\n".join("- "+f for f in FEATURE_CATEGORICAL)+"\n\nV15 candidate limits:\nA: "+str(V15_FILTERS["A_OB_RETEST_SEQUENCE"])+"\nB: "+str(V15_FILTERS["B_FVG_RETEST_SEQUENCE"])+"\nC: "+str(V15_FILTERS["C_DISPLACEMENT_MID_RETEST"])+"\n")
     (out/"SMC_V15_FEATURE_DICTIONARY.txt").write_text(dictionary,encoding="utf-8")
 
 
@@ -2146,6 +2369,32 @@ def _write_dataset_manifest(symbols: list[str], root_out: Path) -> None:
     (root_out / "SMC_V15_DATASET_MANIFEST.txt").write_text("\n".join(manifest) + "\n", encoding="utf-8")
 
 
+DATA_GAP_WARN_DAYS = 5  # longer than a weekend + holiday
+
+
+def data_gap_report(symbol: str, t: dict) -> list[dict]:
+    """List holes in the tick history longer than DATA_GAP_WARN_DAYS (e.g. missing years)."""
+    ms = np.asarray(t["time_msc"], dtype=np.int64)
+    if len(ms) < 2:
+        return []
+    gap_ms = np.diff(ms)
+    idx = np.where(gap_ms > DATA_GAP_WARN_DAYS * 86_400_000)[0]
+    rows = []
+    for k in idx:
+        start = pd.to_datetime(int(ms[k]), unit="ms", utc=True)
+        end = pd.to_datetime(int(ms[k + 1]), unit="ms", utc=True)
+        rows.append({"symbol": symbol, "gap_start": start, "gap_end": end, "gap_days": round(float(gap_ms[k]) / 86_400_000, 1)})
+    first = pd.to_datetime(int(ms[0]), unit="ms", utc=True)
+    last = pd.to_datetime(int(ms[-1]), unit="ms", utc=True)
+    if first - pd.Timestamp(PERIOD_START) > pd.Timedelta(days=DATA_GAP_WARN_DAYS):
+        rows.insert(0, {"symbol": symbol, "gap_start": pd.Timestamp(PERIOD_START), "gap_end": first,
+                        "gap_days": round((first - pd.Timestamp(PERIOD_START)).total_seconds() / 86400, 1)})
+    if pd.Timestamp(PERIOD_END) - last > pd.Timedelta(days=DATA_GAP_WARN_DAYS):
+        rows.append({"symbol": symbol, "gap_start": last, "gap_end": pd.Timestamp(PERIOD_END),
+                     "gap_days": round((pd.Timestamp(PERIOD_END) - last).total_seconds() / 86400, 1)})
+    return rows
+
+
 def prepare_symbol_data(t: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, np.ndarray]:
     """Build M1/M5/M15 bars once per symbol and reuse them across all configs."""
     print("  Building M1/M5/M15 bars once...", flush=True)
@@ -2153,6 +2402,8 @@ def prepare_symbol_data(t: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFra
     b5 = ticks_to_bars(t, M5_RULE)
     b15 = ticks_to_bars(t, M15_RULE)
     atr1 = atr(b1, ATR_PERIOD).to_numpy(float)
+    print("  Building H1/H4/D1 context features once...", flush=True)
+    b1 = add_context_features(b1)
     print(f"  Bars ready | M1={len(b1):,} M5={len(b5):,} M15={len(b15):,}", flush=True)
     return b1, b5, b15, atr1
 
@@ -2251,6 +2502,7 @@ def main() -> None:
     candidate_frames: list[pd.DataFrame] = []
     diagnostics: list[dict] = []
     errors: list[dict] = []
+    data_gaps: list[dict] = []
 
     # Keep isolated per-symbol collections so future ML datasets cannot mix symbols.
     per_symbol_candidates: dict[str, list[pd.DataFrame]] = {s: [] for s in symbols}
@@ -2261,6 +2513,10 @@ def main() -> None:
         try:
             t = load_tick_cache(symbol)
             print(f"Data file: {data_path(symbol)} | ticks={len(t['time_msc']):,}", flush=True)
+            gaps = data_gap_report(symbol, t)
+            data_gaps.extend(gaps)
+            for gp in gaps:
+                print(f"  [DATA GAP] {gp['gap_start']} -> {gp['gap_end']} ({gp['gap_days']} days without ticks)", flush=True)
             b1, b5, b15, atr1 = prepare_symbol_data(t)
 
             for family in FAMILIES:
@@ -2334,6 +2590,8 @@ def main() -> None:
     tr_v15.to_csv(out / "SMC_V15_ALL_TRADES.csv", index=False, encoding="utf-8-sig")
     pd.DataFrame(diagnostics).to_csv(out / "SMC_V15_FILTER_DIAGNOSTICS.csv", index=False, encoding="utf-8-sig")
     pd.DataFrame(errors).to_csv(out / "SMC_V15_ALL_ERRORS.csv", index=False, encoding="utf-8-sig")
+    pd.DataFrame(data_gaps, columns=["symbol", "gap_start", "gap_end", "gap_days"]).to_csv(
+        out / "SMC_V15_DATA_GAPS.csv", index=False, encoding="utf-8-sig")
     if not c_labeled.empty:
         c_labeled.to_csv(out / "SMC_V15_CANDIDATE_FEATURES.csv", index=False, encoding="utf-8-sig")
     _write_feature_analysis(tr_v15, c_labeled, out)
@@ -2371,6 +2629,8 @@ def main() -> None:
     print(f"Per-symbol datasets: {out / 'datasets'}")
     if errors:
         print(f"Errors: {len(errors)} (see SMC_V15_ALL_ERRORS.csv)")
+    if data_gaps:
+        print(f"Data gaps > {DATA_GAP_WARN_DAYS} days: {len(data_gaps)} (see SMC_V15_DATA_GAPS.csv)")
 
 
 if __name__ == "__main__":
