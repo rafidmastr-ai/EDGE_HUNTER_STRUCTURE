@@ -70,6 +70,17 @@ EXCLUDED = {
 }
 CATEGORICAL = ["side", "family", "utc_block", "candidate_tier", "candidate_gate_reason", "sl_mode", "session"]
 
+# H1/H4/D1 and previous-day/week features from an earlier SMC_V15 run; the strategy
+# works on M1/M5/M15 only, so these are never used even if a data file contains them.
+HTF_FEATURES = {
+    "h1_trend_aligned", "h4_trend_aligned", "d1_trend_aligned", "htf_trend_agreement",
+    "h1_dist_ema50_aligned", "h4_dist_ema50_aligned", "h1_rsi_aligned", "h4_rsi_aligned", "h1_adx14",
+    "h1_structure_aligned", "h4_discount_aligned", "risk_d1atr", "h1_swing_target_r", "h1_swing_against_r",
+    "pd_target_d1atr", "pd_against_d1atr", "pd_target_r", "pw_target_d1atr", "pw_against_d1atr",
+    "pd_target_swept_today", "pd_against_swept_today", "day_range_used_d1atr", "day_open_move_aligned",
+    "asia_range_d1atr", "d1_atr_regime", "m1_atr_to_d1atr",
+}
+
 # Direction-dependent features, multiplied by +1 (BUY) / -1 (SELL). Trees could learn the
 # side interaction themselves, but the aligned versions let them do it with far fewer splits.
 DIRECTIONAL = [
@@ -116,7 +127,7 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def feature_columns(df: pd.DataFrame) -> tuple[list[str], list[str]]:
-    dropped = EXCLUDED | set(CATEGORICAL)
+    dropped = EXCLUDED | HTF_FEATURES | set(CATEGORICAL)
     numeric = [c for c in df.columns if c not in dropped and pd.api.types.is_numeric_dtype(df[c])]
     return numeric, list(CATEGORICAL)
 

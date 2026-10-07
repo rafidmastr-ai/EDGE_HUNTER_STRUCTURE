@@ -48,3 +48,6 @@ The models were retrained after `SMC_V15.py` gained 33 context features: H1/H4/D
 - The new features account for about 22–26% of CatBoost's feature importance.
 - Validation AUC did not improve: 0.45–0.51, compared with 0.47–0.53 before. The only deployed filter is still LR on EURUSD (+81.8R on validation; it was +97.5R before).
 - Higher-timeframe trend alignment (`h4_trend_aligned`, `htf_trend_agreement`) predicts better in the most recent period than in training. Keeping only trades with the H4 trend raised average R per trade in 5 of 6 symbol/period cases, but it halves the trade count.
+
+### H1/H4/D1 features removed (October 2026)
+At the user's request, the strategy uses M1/M5/M15 only, including for ML features. `SMC_V15.py` no longer computes any H1, H4, D1, previous-day or previous-week feature. Its context layer is now M1 and clock only: session, today's and Asian range and position, stop size in ATR, and room to the first intraday liquidity in R. Both ML scripts also ignore those columns (`HTF_FEATURES`) if an older data file still contains them. After retraining without them, validation AUC is 0.45–0.54, and the only deployed filter is still LR on EURUSD (+97.1R on validation).
