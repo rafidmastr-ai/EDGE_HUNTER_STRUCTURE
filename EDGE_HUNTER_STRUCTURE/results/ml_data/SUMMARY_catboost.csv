@@ -1,4 +1,0 @@
-symbol,model,edge_detected,filter_deployed,validation_net_r_gain,oof_auc,oof_net_r_gain,folds_positive,valid_auc,candidate_threshold,deployed_threshold,base_trades,base_win_rate,base_net_r,base_pf,filt_trades,filt_win_rate,filt_net_r,filt_pf,winners_kept_pct,losers_removed_pct
-AUDJPY,catboost,True,False,-17.53,0.5523,110.88,4,0.5079,0.3,0.0,795,0.4201,184.18,1.406,604,0.4338,166.65,1.499,0.7844,0.2581
-EURUSD,catboost,True,False,-15.53,0.5331,257.58,4,0.4941,0.35,0.0,3500,0.3226,-243.5,0.897,3074,0.3211,-259.03,0.875,0.8742,0.1198
-XAUUSD,catboost,True,False,-133.0,0.5303,247.73,5,0.4753,0.28,0.0,1291,0.4113,264.12,1.349,865,0.4,131.12,1.254,0.6516,0.3171
