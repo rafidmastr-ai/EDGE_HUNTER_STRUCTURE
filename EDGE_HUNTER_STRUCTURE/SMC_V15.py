@@ -100,6 +100,16 @@ ATR_CAP = 2.50
 # Short-horizon trading.
 MAX_HOLD_MINUTES = 120
 
+# No trade may need the market to reopen before it can be closed: a candidate is
+# skipped at entry when its MAX_HOLD_MINUTES window crosses a market closure
+# (weekend or holiday). A closure is a stretch of at least
+# MARKET_CLOSURE_MIN_MINUTES with no prices in the data, which matches the
+# published trading calendar. The decision uses the holding window, never the
+# trade outcome, so it adds no look-ahead bias.
+# 180 = weekends/holidays only; 30 also excludes the ~1 h daily break (e.g. gold).
+SKIP_TRADES_ACROSS_MARKET_CLOSURE = True
+MARKET_CLOSURE_MIN_MINUTES = 180
+
 # Feature-layer revision only; strategy rules and execution logic are unchanged.
 FEATURE_LAYER_VERSION = "V15_SMC_EVENT_FEATURES_3_M1_CONTEXT"
 
@@ -1941,6 +1951,25 @@ def _quote_arrays(t: dict) -> np.ndarray:
     return _neutral_price_arrays(t)
 
 
+def _window_crosses_market_closure(time_msc: np.ndarray, starts: np.ndarray) -> np.ndarray:
+    """True where the holding window [entry, entry + MAX_HOLD_MINUTES] overlaps a market closure."""
+    time_msc = np.asarray(time_msc, dtype=np.int64)
+    out = np.zeros(len(starts), dtype=bool)
+    if len(time_msc) < 2:
+        return out
+    gap_at = np.where(np.diff(time_msc) >= MARKET_CLOSURE_MIN_MINUTES * 60_000)[0]
+    if gap_at.size == 0:
+        return out
+    close_ms = time_msc[gap_at]  # last price before each closure
+    valid = starts < len(time_msc)
+    entry_ms = time_msc[np.minimum(starts, len(time_msc) - 1)]
+    window_end = entry_ms + MAX_HOLD_MINUTES * 60_000
+    first_close = np.searchsorted(close_ms, entry_ms, side="left")
+    has_close = first_close < len(close_ms)
+    out[valid & has_close] = close_ms[first_close[valid & has_close]] < window_end[valid & has_close]
+    return out
+
+
 def run_symbol_fast(
     symbol: str, t: dict, b1: pd.DataFrame, b5: pd.DataFrame, b15: pd.DataFrame,
     atr1: np.ndarray, family: str, filter_profile: str = V15_PROFILE,
@@ -1981,6 +2010,12 @@ def run_symbol_fast(
         lows[k] = c.anchor_low
         highs[k] = c.anchor_high
         atrvals[k] = atr1[c.signal_idx]
+
+    skipped_closure = 0
+    if SKIP_TRADES_ACROSS_MARKET_CLOSURE:
+        crosses = _window_crosses_market_closure(time_msc, starts)
+        skipped_closure = int(crosses.sum())
+        entries[crosses] = np.nan  # engine skips candidates without an entry price
 
     rr_values = np.asarray(RR_VALUES, dtype=np.float64)
     mode_flags = np.asarray([0, 1], dtype=np.int8)
@@ -2030,7 +2065,7 @@ def run_symbol_fast(
                 **candidates[k].features,
             })
         if not rrows:
-            stats.append({"symbol":symbol,"family":family,"filter_profile":filter_profile,"rr":rr,"sl_mode":mode,"candidates":nc,"trades":0,"wins":0,"losses":0,"timeout":0,"period_end":0,"wr_pct":0.0,"pf":0.0,"total_r":0.0,"closed_r":0.0,"avg_r":0.0,"max_dd_r":0.0})
+            stats.append({"symbol":symbol,"family":family,"filter_profile":filter_profile,"rr":rr,"sl_mode":mode,"candidates":nc,"skipped_market_closure":skipped_closure,"trades":0,"wins":0,"losses":0,"timeout":0,"period_end":0,"wr_pct":0.0,"pf":0.0,"total_r":0.0,"closed_r":0.0,"avg_r":0.0,"max_dd_r":0.0})
             continue
         dfx = pd.DataFrame(rrows)
         wins = int((dfx.result == "TP").sum()); losses = int((dfx.result == "SL").sum())
@@ -2044,7 +2079,8 @@ def run_symbol_fast(
             eq += float(x); peak = max(peak, eq); dd = max(dd, peak-eq)
         closed_r = float(closed.pnl_r.sum()) if not closed.empty else 0.0
         stats.append({
-            "symbol":symbol,"family":family,"filter_profile":filter_profile,"rr":rr,"sl_mode":mode,"candidates":nc,"trades":len(dfx),
+            "symbol":symbol,"family":family,"filter_profile":filter_profile,"rr":rr,"sl_mode":mode,"candidates":nc,
+            "skipped_market_closure":skipped_closure,"trades":len(dfx),
             "wins":wins,"losses":losses,"timeout":timeout,"period_end":pe,
             "wr_pct":wins/(wins+losses)*100 if wins+losses else 0.0,"pf":pf,
             "total_r":float(dfx.pnl_r.sum()),"closed_r":closed_r,
@@ -2588,6 +2624,9 @@ def run_symbols(symbols: list[str], out: Path) -> None:
                         candidates=candidates,
                     )
                     summaries.extend(stats)
+                    if stats and SKIP_TRADES_ACROSS_MARKET_CLOSURE:
+                        print(f"  skipped: {stats[0]['skipped_market_closure']} candidate(s) whose {MAX_HOLD_MINUTES}-min window "
+                              f"crosses a market closure (>= {MARKET_CLOSURE_MIN_MINUTES} min)", flush=True)
                     if not df.empty:
                         trade_frames.append(df)
                         per_symbol_trades[symbol].append(df)
@@ -2660,6 +2699,7 @@ def run_symbols(symbols: list[str], out: Path) -> None:
         + f"RR: {RR_VALUES}\n"
         + f"SL modes: {', '.join(SL_MODES)}\n"
         + f"Max hold: {MAX_HOLD_MINUTES} min\n"
+        + f"Skip trades across market closure: {SKIP_TRADES_ACROSS_MARKET_CLOSURE} (closure >= {MARKET_CLOSURE_MIN_MINUTES} min without prices)\n"
         + "Data layer unchanged; Tick cache preferred, CSV fallback and symbol-input/download workflow unchanged.\n"
         + "V15 candidate expansion: sweep 0.45 ATR; A retest age <=4; B BOS <=0.22 ATR; C BOS <=0.40 ATR.\n"
         + "Structural safeguards unchanged: displacement, confirmation, sweep/retest recency, HTF alignment and M15 veto.\n"
