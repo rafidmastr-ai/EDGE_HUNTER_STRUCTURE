@@ -165,6 +165,30 @@ V15_FILTERS = {
     },
 }
 
+# Quality veto (all three families). Chosen on XAUUSD M1 2020-2023 only and
+# checked on 2024-2026: it improved 12 of 18 RR/SL configurations there, kept
+# ~85% of winners and removed ~18% of losers. Thresholds are the 80th
+# percentiles of the 2020-2023 candidates.
+#  - an over-extended sweep reclaim (close far back inside the swept level)
+#  - a SELL while price is far above the M1 EMA200 (fading a strong uptrend)
+QUALITY_VETO_ENABLED = True
+VETO_SWEEP_RECLAIM_ATR = 0.86
+VETO_SELL_DIST_EMA200_ATR = 3.77
+
+
+def _quality_veto(side: str, feat: dict) -> str:
+    """Return the veto reason, or "" when the candidate is allowed."""
+    if not QUALITY_VETO_ENABLED:
+        return ""
+    reclaim = float(feat.get("sweep_reclaim_strength_atr", np.nan))
+    if np.isfinite(reclaim) and reclaim >= VETO_SWEEP_RECLAIM_ATR:
+        return "sweep_reclaim"
+    dist200 = float(feat.get("dist_ema200_atr", np.nan))
+    if side == "SELL" and np.isfinite(dist200) and dist200 >= VETO_SELL_DIST_EMA200_ATR:
+        return "sell_far_above_ema200"
+    return ""
+
+
 # Compensation required for an expanded candidate. Existing causal SMC/HTF
 # features are used; their calculation is not changed.
 EXP_DISP_BODY_ATR = 0.75
@@ -1473,6 +1497,7 @@ def build_candidates(
         "filter_2_pass": 0,
         "core_pass": 0,
         "expanded_pass": 0,
+        "quality_veto": 0,
         "final_unique": 0,
     }
     try:
@@ -1646,6 +1671,9 @@ def build_candidates(
             if np.isfinite(second_value) and second_value <= float(filter_cfg["second_max"]):
                 diag["filter_2_pass"] += 1
             if not accepted:
+                continue
+            if _quality_veto(side, feature_payload):
+                diag["quality_veto"] += 1
                 continue
             if candidate_tier == "CORE":
                 diag["core_pass"] += 1
@@ -2622,7 +2650,7 @@ def run_symbols(symbols: list[str], out: Path) -> None:
                     print(
                         f"[{symbol}] {family} | sequence_ready={diag['sequence_ready']} "
                         f"| f1={diag['filter_1_pass']} | f2={diag['filter_2_pass']} "
-                        f"| candidates={diag['final_unique']}", flush=True
+                        f"| quality_veto={diag['quality_veto']} | candidates={diag['final_unique']}", flush=True
                     )
 
                     df, stats = run_symbol_fast(
@@ -2706,6 +2734,7 @@ def run_symbols(symbols: list[str], out: Path) -> None:
         + f"RR: {RR_VALUES}\n"
         + f"SL modes: {', '.join(SL_MODES)}\n"
         + f"Max hold: {MAX_HOLD_MINUTES} min\n"
+        + f"Quality veto: {QUALITY_VETO_ENABLED} (sweep reclaim >= {VETO_SWEEP_RECLAIM_ATR} ATR; SELL with dist EMA200 >= {VETO_SELL_DIST_EMA200_ATR} ATR)\n"
         + f"Skip trades across market closure: {SKIP_TRADES_ACROSS_MARKET_CLOSURE} (closure >= {MARKET_CLOSURE_MIN_MINUTES} min without prices)\n"
         + "Data layer unchanged; Tick cache preferred, CSV fallback and symbol-input/download workflow unchanged.\n"
         + "V15 candidate expansion: sweep 0.45 ATR; A retest age <=4; B BOS <=0.22 ATR; C BOS <=0.40 ATR.\n"

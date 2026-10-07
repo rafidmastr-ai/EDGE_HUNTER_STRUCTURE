@@ -8,6 +8,7 @@ Feature layer: V15_SMC_EVENT_FEATURES_3_M1_CONTEXT
 RR: (1.5, 2.0, 2.5)
 SL modes: STRUCTURAL, STRUCTURAL_ATR_BOUNDED
 Max hold: 120 min
+Quality veto: True (sweep reclaim >= 0.86 ATR; SELL with dist EMA200 >= 3.77 ATR)
 Skip trades across market closure: True (closure >= 180 min without prices)
 Data layer unchanged; Tick cache preferred, CSV fallback and symbol-input/download workflow unchanged.
 V15 candidate expansion: sweep 0.45 ATR; A retest age <=4; B BOS <=0.22 ATR; C BOS <=0.40 ATR.
