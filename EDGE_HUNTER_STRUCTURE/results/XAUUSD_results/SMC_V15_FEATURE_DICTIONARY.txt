@@ -1,0 +1,119 @@
+SMC V15 FEATURE DICTIONARY
+================================================================================================
+Features are available at or before signal close; no future outcome/exit data is used.
+
+Existing SMC features preserved. Added technical/market-state features plus the V15 causal SMC-event expansion (sweep reclaim/wick, sweep-to-BOS timing/move, BOS break strength, displacement expansion/compression, sequence age, liquidity distances/asymmetry, M5/M15 trend strength/consistency, and family-specific OB/FVG/midpoint geometry). Context layer (M1 bars and clock only, no H1/H4/D1): London/New York session (DST-aware) and minutes into it, today's range/position/open move, Asian range/position, first intraday liquidity (today's/Asian extreme) in R, stop size in ATR and tick activity. Side-aware features are aligned so positive = in favour of the trade. Strategy rules remain unchanged.
+
+Numeric features:
+- sweep_penetration_atr
+- sweep_age_bars
+- displacement_range_atr
+- displacement_body_atr
+- displacement_body_ratio
+- displacement_close_location
+- bos_distance_atr
+- fvg_size_atr
+- ob_size_atr
+- zone_size_atr
+- retest_age_bars
+- retest_penetration_pct
+- distance_sweep_to_zone_atr
+- distance_entry_to_sweep_atr
+- distance_entry_to_bos_atr
+- m15_opposing_distance_atr
+- m5_dir
+- m15_dir
+- htf_alignment_count
+- sweep_reclaim_strength_atr
+- sweep_wick_ratio
+- sweep_to_bos_bars
+- sweep_to_bos_move_atr
+- bos_break_strength_atr
+- displacement_expansion_ratio
+- pre_displacement_compression
+- sequence_age_bars
+- nearest_liquidity_distance_atr
+- opposing_liquidity_distance_atr
+- liquidity_asymmetry
+- m5_trend_strength
+- m15_trend_strength
+- mtf_trend_consistency
+- rsi14
+- macd_line
+- macd_signal
+- macd_hist
+- adx14
+- plus_di14
+- minus_di14
+- stoch_k14
+- bb_percent_b
+- bb_width_atr
+- ret_1
+- ret_3
+- ret_5
+- ret_15
+- ret_30
+- ret_5_atr
+- ret_15_atr
+- range_atr
+- body_atr
+- upper_wick_ratio
+- lower_wick_ratio
+- dist_ema20_atr
+- dist_ema50_atr
+- dist_ema200_atr
+- ema20_50_gap_atr
+- ema50_200_gap_atr
+- ema20_slope_5_atr
+- ema50_slope_10_atr
+- dist_vwap60_atr
+- volume_z50
+- atr_regime_ratio
+- range_10_atr
+- range_30_atr
+- rsi14_slope_3
+- macd_hist_slope_3
+- adx_slope_3
+- trend_efficiency_20
+- realized_vol_ratio_30_120
+- atr_vs_median_100
+- range_expansion_10_30
+- close_location_3
+- distance_high_60_atr
+- distance_low_60_atr
+- utc_hour_sin
+- utc_hour_cos
+- day_of_week_sin
+- day_of_week_cos
+- side_adjusted_ret_5
+- side_adjusted_ret_15
+- side_adjusted_macd_hist
+- side_adjusted_di_gap
+- utc_hour
+- day_of_week
+- ob_body_quality
+- ob_to_bos_distance_atr
+- fvg_to_displacement_ratio
+- fvg_fill_depth
+- midpoint_retest_depth
+- session_minutes
+- risk_atr
+- day_range_atr
+- day_discount_aligned
+- day_open_move_atr
+- asia_range_atr
+- asia_discount_aligned
+- first_liquidity_target_r
+- activity_ratio_60_1440
+
+Categorical features:
+- side
+- family
+- utc_block
+- candidate_tier
+- session
+
+V15 candidate limits:
+A: {'sweep_min': 0.45, 'second_max': 4.0, 'second_name': 'retest_age_bars', 'expanded_sweep_min': 0.35, 'expanded_second_max': 6.0}
+B: {'sweep_min': 0.45, 'second_max': 0.22, 'second_name': 'bos_distance_atr', 'expanded_sweep_min': 0.4, 'expanded_second_max': 0.28}
+C: {'sweep_min': 0.45, 'second_max': 0.4, 'second_name': 'bos_distance_atr', 'expanded_sweep_min': 0.4, 'expanded_second_max': 0.4}

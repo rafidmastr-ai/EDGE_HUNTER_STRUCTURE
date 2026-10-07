@@ -6,7 +6,7 @@ then keeps only trades whose predicted win probability is above a threshold.
 
 Each symbol is trained and saved on its own: a model trained on XAUUSD is only
 ever used to predict XAUUSD trades. New symbols are picked up automatically as
-soon as results/SMC_V15/datasets/<SYMBOL>/SMC_V15_<SYMBOL>_TRADES.csv exists.
+soon as results/<SYMBOL>_results/SMC_V15_<SYMBOL>_TRADES.csv exists.
 
 Usage:
     python ml_catboost.py train                     # every symbol found
@@ -93,12 +93,20 @@ CENTERED_DIRECTIONAL = {"rsi14": 50.0, "stoch_k14": 50.0, "bb_percent_b": 0.5, "
 
 
 # ----------------------------------------------------------------------------- data
+def _symbol_dir(symbol: str) -> Path:
+    """results/<SYMBOL>_results (current layout) or results/SMC_V15/datasets/<SYMBOL> (old)."""
+    new = HERE / "results" / f"{symbol}_results"
+    return new if (new / f"SMC_V15_{symbol}_TRADES.csv").exists() else DATASETS_DIR / symbol
+
+
 def available_symbols() -> list[str]:
-    return sorted(p.parent.name for p in DATASETS_DIR.glob("*/SMC_V15_*_TRADES.csv"))
+    found = {p.name[len("SMC_V15_"):-len("_TRADES.csv")] for p in (HERE / "results").glob("*_results/SMC_V15_*_TRADES.csv")}
+    found |= {p.parent.name for p in DATASETS_DIR.glob("*/SMC_V15_*_TRADES.csv")}
+    return sorted(found)
 
 
 def load_trades(symbol: str) -> pd.DataFrame:
-    base = DATASETS_DIR / symbol / f"SMC_V15_{symbol}_"
+    base = _symbol_dir(symbol) / f"SMC_V15_{symbol}_"
     df = pd.read_csv(f"{base}TRADES.csv", encoding="utf-8-sig")
     dataset = Path(f"{base}DATASET.csv")
     if dataset.exists():  # causal confluence count lives only in the candidate dataset

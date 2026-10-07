@@ -1,0 +1,20 @@
+SMC V15 HISTORICAL DATASET MANIFEST
+================================================================================================
+Purpose: candidate/feature/outcome export for future per-symbol ML.
+No ML training or inference is performed by V15.
+Period UTC: 2020-01-01T00:00:00+00:00 -> 2026-09-30T23:59:59.999000+00:00
+Data source: existing Tick Data/cache/download/input workflow is unchanged.
+Families: A, B, C are independent; no cross-family deduplication.
+Each dataset row represents ONE unique strategy candidate per symbol/family/setup_id.
+RR/SL scenarios are stored as separate outcome columns, not duplicate candidate rows.
+All exported features are causal and available no later than the signal candle close.
+Per-symbol isolation: no candidate/outcome data from another symbol is placed into a symbol dataset.
+
+Symbols:
+- XAUUSD
+
+Per-symbol files:
+Output folder: results/<SYMBOL>_results/
+- SMC_V15_<SYMBOL>_DATASET.csv : one row per unique candidate + features + outcome matrix
+- SMC_V15_<SYMBOL>_CANDIDATES.csv : raw candidate-level features/quality/confluence
+- SMC_V15_<SYMBOL>_TRADES.csv : executed V15 scenario results

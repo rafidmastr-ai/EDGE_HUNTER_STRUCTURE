@@ -2366,7 +2366,7 @@ def _write_symbol_datasets(
     root_out: Path,
 ) -> None:
     """Write only V15 datasets for one symbol in an isolated folder."""
-    sym_dir = root_out / "datasets" / str(symbol).upper()
+    sym_dir = root_out  # results/<SYMBOL>_results
     sym_dir.mkdir(parents=True, exist_ok=True)
     if not dataset.empty:
         dataset.to_csv(sym_dir / f"SMC_V15_{symbol.upper()}_DATASET.csv", index=False, encoding="utf-8-sig")
@@ -2395,6 +2395,7 @@ def _write_dataset_manifest(symbols: list[str], root_out: Path) -> None:
         *[f"- {s}" for s in symbols],
         "",
         "Per-symbol files:",
+        "Output folder: results/<SYMBOL>_results/",
         "- SMC_V15_<SYMBOL>_DATASET.csv : one row per unique candidate + features + outcome matrix",
         "- SMC_V15_<SYMBOL>_CANDIDATES.csv : raw candidate-level features/quality/confluence",
         "- SMC_V15_<SYMBOL>_TRADES.csv : executed V15 scenario results",
@@ -2508,8 +2509,6 @@ def run_symbol_legacy(
 
 def main() -> None:
     root = Path(__file__).resolve().parent
-    out = root / "results" / "SMC_V15"
-    out.mkdir(parents=True, exist_ok=True)
 
     print("=" * 100)
     print("SMC MTF RESEARCH V15 | CANDIDATE + DATASET GENERATOR | TICK DATA | GROSS / NO BROKER COSTS")
@@ -2530,6 +2529,14 @@ def main() -> None:
     print("Data layer: unchanged | Tick cache preferred, CSV fallback and symbol download/input workflow unchanged.")
     print(f"V15 filters: {V15_FILTERS}")
 
+    # Each symbol runs on its own and writes everything to results/<SYMBOL>_results.
+    for symbol in symbols:
+        run_symbols([symbol], root / "results" / f"{symbol}_results")
+
+
+def run_symbols(symbols: list[str], out: Path) -> None:
+    """Run all three families for `symbols` and write every output file into `out`."""
+    out.mkdir(parents=True, exist_ok=True)
     summaries: list[dict] = []
     trade_frames: list[pd.DataFrame] = []
     candidate_frames: list[pd.DataFrame] = []
@@ -2613,7 +2620,10 @@ def main() -> None:
     candidates_all = pd.concat(candidate_frames, ignore_index=True) if candidate_frames else pd.DataFrame()
 
     # Attach causal labels to the combined V15 audit files.
-    tr_v15, c_labeled = _attach_from_candidate_labels(tr, candidates_all)
+    if tr.empty:
+        tr_v15, c_labeled = tr, candidates_all
+    else:
+        tr_v15, c_labeled = _attach_from_candidate_labels(tr, candidates_all)
     if not tr_v15.empty:
         tr_v15["model_version"] = "V15"
     if not s.empty:
@@ -2660,7 +2670,6 @@ def main() -> None:
     (out / "SMC_V15_RUN_REPORT.txt").write_text(report, encoding="utf-8")
 
     print(f"\nV15 BACKTEST + DATASET EXPORT COMPLETE. Results: {out}")
-    print(f"Per-symbol datasets: {out / 'datasets'}")
     if errors:
         print(f"Errors: {len(errors)} (see SMC_V15_ALL_ERRORS.csv)")
     if data_gaps:

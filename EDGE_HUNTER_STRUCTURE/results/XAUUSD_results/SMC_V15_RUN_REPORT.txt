@@ -1,0 +1,16 @@
+SMC MTF RESEARCH V15
+====================================================================================================
+Period: 2020-01-01T00:00:00+00:00 -> 2026-09-30T23:59:59.999000+00:00
+Symbols requested: XAUUSD
+Families: A_OB_RETEST_SEQUENCE, B_FVG_RETEST_SEQUENCE, C_DISPLACEMENT_MID_RETEST
+Version: V15 (V15_QUALITY_PRESERVING_EXPANDED)
+Feature layer: V15_SMC_EVENT_FEATURES_3_M1_CONTEXT
+RR: (1.5, 2.0, 2.5)
+SL modes: STRUCTURAL, STRUCTURAL_ATR_BOUNDED
+Max hold: 120 min
+Data layer unchanged; Tick cache preferred, CSV fallback and symbol-input/download workflow unchanged.
+V15 candidate expansion: sweep 0.45 ATR; A retest age <=4; B BOS <=0.22 ATR; C BOS <=0.40 ATR.
+Structural safeguards unchanged: displacement, confirmation, sweep/retest recency, HTF alignment and M15 veto.
+No ML training/inference. Feature vectors are causal and exported per symbol.
+Each per-symbol dataset has one row per unique candidate; RR/SL outcomes are columns, not duplicated candidates.
+No previous-version result matrix is loaded, compared, or written.
