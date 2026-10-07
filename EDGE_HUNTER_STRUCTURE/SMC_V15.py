@@ -1500,7 +1500,14 @@ def build_candidates(
                 return False
         return True
 
+    progress_every = max(len(d) // 10, 1)
+    started = datetime.now()
     for i in range(len(d)):
+        if diagnostics and i and i % progress_every == 0:
+            # Progress only; the full candidate scan is a per-bar loop and can take minutes.
+            elapsed = (datetime.now() - started).total_seconds()
+            remaining = elapsed / i * (len(d) - i)
+            print(f"    {family}: {i / len(d):4.0%} of bars scanned | ~{remaining / 60:.0f} min left", flush=True)
         confirmed = i - SWING
         if confirmed >= SWING:
             if sw_hi[confirmed]:
