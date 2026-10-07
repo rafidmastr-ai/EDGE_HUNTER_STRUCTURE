@@ -10,7 +10,9 @@ V15 is a single research version: it expands candidate capture modestly while pr
 No previous-version result matrix is executed, loaded, compared, or written by this file.
 
 Research period (UTC): 2020-01-01 -> 2026-09-30
-Data source: data/tick_cache/<SYMBOL>.parquet (preferred) or CSV fallback.
+Data source: data/tick_cache/<SYMBOL>.parquet (preferred) or CSV fallback, or M1 OHLC
+files (data/tick_cache/<SYMBOL>_M1*.csv with timestamp,open,high,low,close,tick_volume,spread)
+replayed conservatively (stop before target when one bar touches both). See DATA_MODE.
 Execution: M1 decision -> next M1 executable quote; SL/TP resolved on ticks.
 Higher timeframes: M5 and M15 are mapped only after their bars are complete.
 Context features (session, today's/Asian range, stop size) come from M1 bars and the
@@ -334,7 +336,10 @@ def _parse_time_msc(series: pd.Series) -> np.ndarray:
         ts = pd.to_datetime(raw, utc=True, errors="coerce")
     if ts.isna().all():
         raise ValueError("Could not parse timestamps in symbol data.")
-    return (ts.astype("int64") // 1_000_000).to_numpy(np.int64)
+    # Explicit ms unit: newer pandas may parse text timestamps at s/us resolution,
+    # so dividing the raw int64 by 1e6 would give wrong times.
+    ts = pd.Series(ts).dt.as_unit("ms")
+    return np.asarray(ts.array.asi8, dtype=np.int64)  # same length as input; NaT -> int64 min as before
 
 
 def _normalize_tick_frame(frame: pd.DataFrame) -> pd.DataFrame:
@@ -659,8 +664,139 @@ def _load_symbol_csv(symbol: str, start_dt: datetime, end_dt: datetime) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# M1 OHLC input (alternative to Tick Data). Strategy and execution are unchanged.
+# ---------------------------------------------------------------------------
+# DATA_MODE: "AUTO" uses M1 OHLC files when they exist for a symbol, otherwise
+# Tick Data; "TICK" or "M1" forces one source.
+DATA_MODE = "AUTO"
+# Each M1 bar is replayed as 4 prices inside its minute (open, then the two
+# extremes, then close) and fed to the existing tick engine. The order of the
+# extremes inside a bar is unknown, so the engine runs twice: BUY trades see the
+# low before the high and SELL trades the high before the low. When one bar
+# touches both stop and target, the trade is therefore always counted as a loss.
+M1_TICK_OFFSETS_MS = np.array([0, 20_000, 40_000, 59_999], dtype=np.int64)
+M1_OHLC_COLUMN_ALIASES = {
+    "time": "timestamp", "datetime": "timestamp", "date": "timestamp",
+    "tick_volume": "volume", "tickvol": "volume", "real_volume": "real_volume",
+}
+
+
+def _is_ohlc_columns(columns) -> bool:
+    cols = {str(c).strip().lower() for c in columns}
+    return {"open", "high", "low", "close"} <= cols and "bid" not in cols
+
+
+def _file_columns(path: Path) -> list[str]:
+    if path.suffix.lower() == ".parquet":
+        if not PARQUET_AVAILABLE:
+            return []
+        return list(pq.ParquetFile(path).schema.names)
+    return list(pd.read_csv(path, nrows=0, encoding="utf-8-sig").columns)
+
+
+def m1_ohlc_files(symbol: str) -> list[Path]:
+    """M1 OHLC files for a symbol: <SYMBOL>_M1*.csv/.parquet, or <SYMBOL>.csv/.parquet with OHLC columns."""
+    s = safe_symbol(symbol)
+    found: list[Path] = []
+    for folder in (TICK_CACHE_DIR, DATA_DIR):
+        for ext in ("csv", "parquet"):
+            found.extend(sorted(p for p in folder.glob(f"{s}_M1*.{ext}") if p.is_file()))
+    if not found:
+        for p in _data_candidates(s):
+            try:
+                if p.exists() and p.is_file() and _is_ohlc_columns(_file_columns(p)):
+                    found.append(p)
+                    break
+            except Exception:
+                continue
+    return list(dict.fromkeys(found))
+
+
+def _infer_point(prices: np.ndarray) -> float:
+    """Smallest price step implied by the number of decimals in the data."""
+    sample = prices[np.isfinite(prices)][:20_000]
+    for k in range(0, 7):
+        scaled = sample * (10 ** k)
+        if np.all(np.abs(scaled - np.round(scaled)) < 1e-6):
+            return float(10 ** -k)
+    return 1e-5
+
+
+def _read_m1_frame(path: Path) -> pd.DataFrame:
+    df = pd.read_parquet(path) if path.suffix.lower() == ".parquet" else pd.read_csv(path, encoding="utf-8-sig")
+    df = df.rename(columns={c: str(c).strip().lower() for c in df.columns})
+    df = df.rename(columns={k: v for k, v in M1_OHLC_COLUMN_ALIASES.items() if k in df.columns and v not in df.columns})
+    if "timestamp" not in df.columns:
+        raise ValueError(f"{path.name}: M1 OHLC file needs a timestamp/time column.")
+    for col in ("open", "high", "low", "close"):
+        if col not in df.columns:
+            raise ValueError(f"{path.name}: M1 OHLC file is missing column '{col}'.")
+    out = pd.DataFrame({"time_msc": _parse_time_msc(df["timestamp"])})
+    for col in ("open", "high", "low", "close"):
+        out[col] = pd.to_numeric(df[col], errors="coerce").to_numpy(float)
+    out["volume"] = pd.to_numeric(df["volume"], errors="coerce").to_numpy(float) if "volume" in df.columns else 1.0
+    out["spread"] = pd.to_numeric(df["spread"], errors="coerce").to_numpy(float) if "spread" in df.columns else 0.0
+    return out
+
+
+def load_m1_ohlc(symbol: str, start_dt: datetime, end_dt: datetime) -> dict:
+    """Load M1 OHLC bars and replay them as a tick-like stream for the unchanged engine."""
+    files = m1_ohlc_files(symbol)
+    if not files:
+        raise RuntimeError(f"No M1 OHLC file found for {symbol} in {TICK_CACHE_DIR} or {DATA_DIR}.")
+    bars = pd.concat([_read_m1_frame(p) for p in files], ignore_index=True)
+    start_ms, end_ms = int(start_dt.timestamp() * 1000), int(end_dt.timestamp() * 1000)
+    bars = bars[(bars["time_msc"] >= start_ms) & (bars["time_msc"] <= end_ms)]
+    bars = bars.dropna(subset=["open", "high", "low", "close"])
+    bars = bars[(bars[["open", "high", "low", "close"]] > 0).all(axis=1)]
+    bars = bars.sort_values("time_msc", kind="mergesort").drop_duplicates("time_msc", keep="last").reset_index(drop=True)
+    if bars.empty:
+        raise RuntimeError(f"M1 OHLC files for {symbol} contain no bars in the requested period.")
+    o, c = bars["open"].to_numpy(float), bars["close"].to_numpy(float)
+    h = np.maximum.reduce([bars["high"].to_numpy(float), o, c])
+    l = np.minimum.reduce([bars["low"].to_numpy(float), o, c])
+
+    metadata = _read_metadata(symbol)
+    meta_point = float(metadata.get("point", 0.0) or 0.0)
+    spread_point = meta_point if meta_point > 0 else _infer_point(c)
+    point = meta_point if meta_point > 0 else _fallback_point(symbol)
+    # MT5 M1 bars are Bid prices; half the bar spread gives the same mid price the tick path uses.
+    spread_px = np.nan_to_num(bars["spread"].to_numpy(float), nan=0.0).clip(min=0.0) * spread_point
+    volume = np.nan_to_num(bars["volume"].to_numpy(float), nan=0.0).clip(min=0.0)
+
+    n = len(bars)
+    time_msc = (bars["time_msc"].to_numpy(np.int64)[:, None] + M1_TICK_OFFSETS_MS[None, :]).ravel()
+    buy_path = np.column_stack([o, l, h, c]).ravel()    # low first: worst case for BUY
+    sell_path = np.column_stack([o, h, l, c]).ravel()   # high first: worst case for SELL
+    # Round to the quote precision, as real Bid/Ask ticks are, so the mid price is
+    # computed exactly like the tick path (no float noise at the ATR-cap boundary).
+    decimals = int(round(-math.log10(spread_point))) if spread_point > 0 else 5
+    buy_path, sell_path = np.round(buy_path, decimals), np.round(sell_path, decimals)
+    spread_rep = np.repeat(spread_px, 4)
+    buy_ask, sell_ask = np.round(buy_path + spread_rep, decimals), np.round(sell_path + spread_rep, decimals)
+    weight = np.column_stack([volume, np.zeros(n), np.zeros(n), np.zeros(n)]).ravel()
+    print(f"  M1 OHLC source: {len(files)} file(s), {n:,} bars, spread point={spread_point:g}", flush=True)
+    return {
+        "time_msc": time_msc,
+        "bid": buy_path, "ask": buy_ask,
+        "sell_bid": sell_path, "sell_ask": sell_ask,
+        "last": np.zeros(len(time_msc)),
+        "volume_weight": weight,
+        "metadata": {**metadata, "symbol": safe_symbol(symbol), "point": point,
+                     "tick_size": float(metadata.get("tick_size", point) or point)},
+        "data_path": ", ".join(str(p) for p in files),
+        "data_source": "M1_OHLC",
+    }
+
+
 def load_tick_cache(symbol: str) -> dict:
-    return _load_symbol_csv(symbol, PERIOD_START, PERIOD_END)
+    mode = DATA_MODE.upper()
+    if mode == "M1" or (mode == "AUTO" and m1_ohlc_files(symbol)):
+        return load_m1_ohlc(symbol, PERIOD_START, PERIOD_END)
+    t = _load_symbol_csv(symbol, PERIOD_START, PERIOD_END)
+    t["data_source"] = "TICK"
+    return t
 
 
 # Tick -> bar construction
@@ -677,14 +813,20 @@ def tick_price_series(t: dict) -> pd.DataFrame:
     last[invalid & (bid > 0)] = bid[invalid & (bid > 0)]
     invalid = (last <= 0) | ~np.isfinite(last)
     last[invalid & (ask > 0)] = ask[invalid & (ask > 0)]
-    out = pd.DataFrame({"price": last}, index=idx).dropna()
+    out = pd.DataFrame({"price": last}, index=idx)
+    if "volume_weight" in t:  # M1 OHLC replay: bar volume = tick_volume, not replayed price count
+        out["weight"] = np.asarray(t["volume_weight"], dtype=float)
+    out = out.dropna(subset=["price"])
     return out[out["price"] > 0]
 
 
 def ticks_to_bars(t: dict, rule: str) -> pd.DataFrame:
     s = tick_price_series(t)
     bars = s["price"].resample(rule, label="left", closed="left").ohlc()
-    bars["volume"] = s["price"].resample(rule, label="left", closed="left").count()
+    if "weight" in s.columns:
+        bars["volume"] = s["weight"].resample(rule, label="left", closed="left").sum()
+    else:
+        bars["volume"] = s["price"].resample(rule, label="left", closed="left").count()
     bars = bars.dropna(subset=["open", "high", "low", "close"]).reset_index(names="timestamp")
     return bars
 
@@ -1848,6 +1990,20 @@ def run_symbol_fast(
         float(SL_BUFFER_POINTS), float(SL_BUFFER_ATR), float(ATR_FLOOR),
         float(ATR_CAP), float(EXIT_SLIPPAGE_POINTS)
     )
+    if "sell_bid" in t and np.any(sides == -1):
+        # M1 OHLC replay: SELL trades use the high-before-low path (worst case for SELL).
+        # Exit bars are identical on both paths, so position overlap decisions match.
+        sell_quote = _neutral_price_arrays({"bid": t["sell_bid"], "ask": t["sell_ask"], "last": t["last"]})
+        s_res, s_exit, s_pnl, s_sl, s_tp = _run_configs_numba(
+            time_msc, sell_quote, starts, expiry_idx, sides, entries,
+            lows, highs, atrvals, points, rr_values, mode_flags,
+            float(SL_BUFFER_POINTS), float(SL_BUFFER_ATR), float(ATR_FLOOR),
+            float(ATR_CAP), float(EXIT_SLIPPAGE_POINTS)
+        )
+        sell = sides == -1
+        result[:, sell] = s_res[:, sell]; exit_idx[:, sell] = s_exit[:, sell]
+        pnl[:, sell] = s_pnl[:, sell]; sl_out[:, sell] = s_sl[:, sell]; tp_out[:, sell] = s_tp[:, sell]
+    data_source = t.get("data_source", "TICK")
 
     rows, stats = [], []
     for cfg in range(result.shape[0]):
@@ -1869,6 +2025,7 @@ def run_symbol_fast(
                 "sl": float(sl_out[cfg, k]), "tp": float(tp_out[cfg, k]),
                 "result": outcome, "pnl_r": float(pnl[cfg, k]),
                 "cost_model": "GROSS_NO_SPREAD_NO_COMMISSION",
+                "data_source": data_source,
                 "setup_id": candidates[k].setup_id,
                 **candidates[k].features,
             })
@@ -2143,7 +2300,7 @@ def _build_symbol_dataset(
 
     key = ["symbol", "filter_profile", "family", "setup_id"]
     base_cols = key + [
-        "signal_time", "entry_time", "side", "quality_score", "quality_score_max",
+        "signal_time", "entry_time", "side", "data_source", "quality_score", "quality_score_max",
         "quality_score_version", "quality_band", "confluence_count",
         "confluence_families", "confluence_window_min",
     ] + [f for f in FEATURE_NUMERIC if f in c.columns] + [
@@ -2388,7 +2545,7 @@ def main() -> None:
         print(f"\n### {symbol} | V15 CANDIDATES / DATASET")
         try:
             t = load_tick_cache(symbol)
-            print(f"Data file: {data_path(symbol)} | ticks={len(t['time_msc']):,}", flush=True)
+            print(f"Data source: {t.get('data_source', 'TICK')} | {t.get('data_path', data_path(symbol))} | price points={len(t['time_msc']):,}", flush=True)
             gaps = data_gap_report(symbol, t)
             data_gaps.extend(gaps)
             for gp in gaps:
@@ -2408,6 +2565,7 @@ def main() -> None:
 
                     cf = _candidates_to_frame(candidates, symbol, V15_PROFILE)
                     if not cf.empty:
+                        cf["data_source"] = t.get("data_source", "TICK")
                         candidate_frames.append(cf)
                         per_symbol_candidates[symbol].append(cf)
 
